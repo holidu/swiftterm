@@ -1570,7 +1570,7 @@ extension TerminalView {
     func feedPrepare()
     {
         search.invalidate()
-        selection.active = false
+        // selection.active = false  // Preserve selection during streaming output
         startDisplayUpdates()
     }
     

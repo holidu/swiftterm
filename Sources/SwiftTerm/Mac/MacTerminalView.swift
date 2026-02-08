@@ -451,7 +451,7 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     }
     
     open func linefeed(source: Terminal) {
-        selection.selectNone()
+        // selection.selectNone()  // Preserve selection during linefeed
     }
     
     /// This vaiable controls whether mouse events are sent to the application running under the
