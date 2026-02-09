@@ -5303,6 +5303,16 @@ open class Terminal {
         synchronizedOutputBufferIsAlternate = false
         synchronizedOutputTimeoutItem?.cancel()
         synchronizedOutputTimeoutItem = nil
+
+        // Ensure viewport is at bottom after sync output completes,
+        // unless the user has explicitly scrolled up.
+        if !userScrolling {
+            let buffer = displayBuffer
+            if buffer.yDisp != buffer.yBase {
+                buffer.yDisp = buffer.yBase
+            }
+        }
+
         refresh (startRow: 0, endRow: rows - 1)
         tdel?.synchronizedOutputChanged(source: self, active: false)
     }
