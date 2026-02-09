@@ -99,14 +99,19 @@ extension TerminalView {
         // Calculation assume that all glyphs in the font have the same advancement.
         // Get the ascent + descent + leading from the font, already scaled for the font's size
         self.cellDimension = computeFontDimensions ()
-        
-        let terminalOptions = TerminalOptions(cols: Int(width / cellDimension.width),
-                                              rows: Int(height / cellDimension.height))
-        
+
+        let newCols = Int(width / cellDimension.width)
+        let newRows = Int(height / cellDimension.height)
+
         if terminal == nil {
+            let terminalOptions = TerminalOptions(cols: newCols, rows: newRows)
             terminal = Terminal(delegate: self, options: terminalOptions)
         } else {
-            terminal.options = terminalOptions
+            // Preserve user-configured options (scrollback, cursorStyle, etc.)
+            // when updating cols/rows on resize. Creating a fresh TerminalOptions
+            // would reset scrollback to the default (500).
+            terminal.options.cols = newCols
+            terminal.options.rows = newRows
             terminal.setup(isReset: false)
         }
         terminal.backgroundColor = Color.defaultBackground
