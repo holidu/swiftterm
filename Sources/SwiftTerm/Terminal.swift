@@ -442,6 +442,9 @@ open class Terminal {
     var scrollInvariantRefreshStart = Int.max
     var scrollInvariantRefreshEnd = -1
     public var userScrolling = false
+    /// Timestamp of the last data feed from PTY (updated in `parse()`).
+    /// App code can poll this to detect when output stops.
+    public var lastFeedTimestamp: CFAbsoluteTime = 0
     var lineFeedMode = false
     
     // We do not implement smooth scrolling here, dubious value, but
@@ -4723,6 +4726,7 @@ open class Terminal {
      */
     public func parse (buffer: ArraySlice<UInt8>)
     {
+        lastFeedTimestamp = CFAbsoluteTimeGetCurrent()
         parser.parse(data: buffer)
     }
      
