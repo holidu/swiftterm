@@ -62,6 +62,11 @@ public protocol LocalProcessDelegate: AnyObject {
  */
 public class LocalProcess {
     let readSize = 128*1024
+    // Feed data to the terminal in chunks of this size so the main thread can
+    // process display updates between chunks, preventing UI freezes during large
+    // output bursts.  Mirrors the fix from migueldeicaza/SwiftTerm#91 / aed87e2
+    // which applied the same pattern to the iOS SSH path.
+    let feedChunkSize = 1024
     
     /* The file descriptor used to communicate with the child process */
     public private(set) var childfd: Int32 = -1
@@ -203,8 +208,17 @@ public class LocalProcess {
                 }
             }
         })
-        dispatchQueue.sync {
-            delegate?.dataReceived(slice: b[...])
+        // Feed data in small chunks so the main thread can service display updates
+        // between chunks.  Without this, a single 128KB read blocks the main thread
+        // for the entire parse duration, causing the terminal to appear frozen.
+        var offset = b.startIndex
+        while offset < b.endIndex {
+            let end = min(offset + feedChunkSize, b.endIndex)
+            let chunk = b[offset..<end]
+            dispatchQueue.sync {
+                delegate?.dataReceived(slice: chunk)
+            }
+            offset = end
         }
         io?.read(offset: 0, length: readSize, queue: readQueue, ioHandler: childProcessRead)
     }

@@ -7,6 +7,9 @@
 //
 #if os(macOS) || os(iOS) || os(visionOS)
 import Foundation
+#if APP_DEBUG
+// STDebugLog is defined in Terminal.swift and shared across the module
+#endif
 import CoreGraphics
 import CoreText
 #if canImport(ImageIO)
@@ -1308,6 +1311,9 @@ extension TerminalView {
     {
         updateCursorPosition()
         guard let (rowStart, rowEnd) = terminal.getUpdateRange () else {
+            #if APP_DEBUG
+            STDebugLog.shared.log("[\(terminal.debugLabel ?? "unknown")] updateDisplay: getUpdateRange() nil (no dirty rows), scrollback=\(terminal.options.scrollback)")
+            #endif
             if notifyUpdateChanges {
                 let buffer = terminal.displayBuffer
                 let y = buffer.yDisp+buffer.y
@@ -1400,6 +1406,9 @@ extension TerminalView {
     func queuePendingDisplay ()
     {
         // throttle
+        #if APP_DEBUG
+        let wasAlreadyPending = pendingDisplay
+        #endif
         if !pendingDisplay {
             let fps60 = 16670000
             // let fps30 = 16670000*2
@@ -1409,6 +1418,11 @@ extension TerminalView {
                 deadline: DispatchTime (uptimeNanoseconds: DispatchTime.now().uptimeNanoseconds + UInt64 (fpsDelay)),
                 execute: updateDisplay)
         }
+        #if APP_DEBUG
+        if wasAlreadyPending {
+            STDebugLog.shared.log("[\(terminal.debugLabel ?? "unknown")] queuePendingDisplay: SKIPPED (already pending), scrollback=\(terminal.options.scrollback)")
+        }
+        #endif
     }
     
     ///
