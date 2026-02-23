@@ -214,9 +214,9 @@ public class LocalProcess {
         var offset = b.startIndex
         while offset < b.endIndex {
             let end = min(offset + feedChunkSize, b.endIndex)
-            let chunk = b[offset..<end]
-            dispatchQueue.sync {
-                delegate?.dataReceived(slice: chunk)
+            let chunk = Array(b[offset..<end])
+            dispatchQueue.async { [weak self] in
+                self?.delegate?.dataReceived(slice: chunk[...])
             }
             offset = end
         }

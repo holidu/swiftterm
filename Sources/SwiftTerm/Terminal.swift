@@ -3328,6 +3328,14 @@ open class Terminal {
     {
         cmdSoftReset()
     }
+
+    /// Performs post-resize cleanup without resetting terminal state.
+    /// Unlike softReset(), this preserves colors, modes, and character attributes
+    /// that programs (vim, tmux, etc.) may have set.
+    public func resizeCleanup ()
+    {
+        tdel?.showCursor(source: self)
+    }
     
     //
     // CSI Ps n  Device Status Report (DSR).
