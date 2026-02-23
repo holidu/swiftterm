@@ -373,7 +373,7 @@ public class LocalProcess {
             env = environment!
         }
 
-        if let (shellPid, childfd) = PseudoTerminalHelpers.fork(andExec: executable, args: shellArgs, env: env, currentDirectory: currentDirectory, desiredWindowSize: &size) {
+        if let (shellPid, childfd) = PseudoTerminalHelpers.spawnWithPty(executable: executable, args: shellArgs, env: env, currentDirectory: currentDirectory, desiredWindowSize: &size) {
 #if os(macOS)
             childMonitor = DispatchSource.makeProcessSource(identifier: shellPid, eventMask: .exit, queue: dispatchQueue)
             if let cm = childMonitor {
