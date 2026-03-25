@@ -62,11 +62,6 @@ public protocol LocalProcessDelegate: AnyObject {
  */
 public class LocalProcess {
     let readSize = 128*1024
-    // Feed data to the terminal in chunks of this size so the main thread can
-    // process display updates between chunks, preventing UI freezes during large
-    // output bursts.  Mirrors the fix from migueldeicaza/SwiftTerm#91 / aed87e2
-    // which applied the same pattern to the iOS SSH path.
-    let feedChunkSize = 1024
     
     /* The file descriptor used to communicate with the child process */
     public private(set) var childfd: Int32 = -1
@@ -90,6 +85,14 @@ public class LocalProcess {
     var readQueue: DispatchQueue
     
     var io: DispatchIO?
+
+    private let usesMainQueue: Bool
+    private let pendingChunkFlushThreshold = 32
+    private let pendingTimeSliceNs: UInt64 = 4_000_000
+    private var pendingChunks: [[UInt8]] = []
+    private var pendingChunkIndex: Int = 0
+    private var pendingScheduled = false
+    private let pendingLock = NSLock()
     
     #if canImport(Subprocess)
     // Swift Subprocess related properties
@@ -111,6 +114,56 @@ public class LocalProcess {
         self.delegate = delegate
         self.dispatchQueue = dispatchQueue ?? DispatchQueue.main
         self.readQueue = DispatchQueue(label: "sender")
+        self.usesMainQueue = self.dispatchQueue === DispatchQueue.main
+    }
+
+    private func enqueueReceivedData(_ bytes: [UInt8]) {
+        pendingLock.lock()
+        pendingChunks.append(bytes)
+        let shouldSchedule = !pendingScheduled
+        if shouldSchedule {
+            pendingScheduled = true
+        }
+        pendingLock.unlock()
+        if shouldSchedule {
+            dispatchQueue.async { [weak self] in
+                self?.drainReceivedData()
+            }
+        }
+    }
+
+    private func drainReceivedData() {
+        let start = DispatchTime.now().uptimeNanoseconds
+        while true {
+            var chunk: [UInt8]?
+            pendingLock.lock()
+            if pendingChunkIndex < pendingChunks.count {
+                chunk = pendingChunks[pendingChunkIndex]
+                pendingChunkIndex += 1
+                if pendingChunkIndex >= pendingChunkFlushThreshold {
+                    pendingChunks.removeFirst(pendingChunkIndex)
+                    pendingChunkIndex = 0
+                }
+            } else {
+                pendingChunks.removeAll(keepingCapacity: true)
+                pendingChunkIndex = 0
+                pendingScheduled = false
+                pendingLock.unlock()
+                return
+            }
+            pendingLock.unlock()
+
+            if let chunk {
+                delegate?.dataReceived(slice: chunk[...])
+            }
+
+            if DispatchTime.now().uptimeNanoseconds - start >= pendingTimeSliceNs {
+                dispatchQueue.async { [weak self] in
+                    self?.drainReceivedData()
+                }
+                return
+            }
+        }
     }
     
     /**
@@ -169,7 +222,17 @@ public class LocalProcess {
         }
     }
     #endif
-    
+
+    func childStopped(cancelProcessMonitor: Bool = true) {
+        running = false
+#if os(macOS)
+        if cancelProcessMonitor {
+            childMonitor?.cancel()
+            childMonitor = nil
+        }
+#endif
+    }
+
     /* Total number of bytes read */
     var totalRead = 0
     func childProcessRead (done: Bool, data: DispatchData?, errno: Int32) {
@@ -188,7 +251,9 @@ public class LocalProcess {
         if data.count == 0 {
             childfd = -1
             if running {
-                running = false
+                // Keep process monitor alive so the exit event can still deliver
+                // processTerminated to clients when PTY EOF arrives first.
+                childStopped(cancelProcessMonitor: false)
                 // delegate.processTerminated (self, exitCode: nil)
             }
             return
@@ -208,17 +273,12 @@ public class LocalProcess {
                 }
             }
         })
-        // Feed data in small chunks so the main thread can service display updates
-        // between chunks.  Without this, a single 128KB read blocks the main thread
-        // for the entire parse duration, causing the terminal to appear frozen.
-        var offset = b.startIndex
-        while offset < b.endIndex {
-            let end = min(offset + feedChunkSize, b.endIndex)
-            let chunk = Array(b[offset..<end])
-            dispatchQueue.async { [weak self] in
-                self?.delegate?.dataReceived(slice: chunk[...])
+        if usesMainQueue {
+            enqueueReceivedData(b)
+        } else {
+            dispatchQueue.sync {
+                self.delegate?.dataReceived(slice: b[...])
             }
-            offset = end
         }
         io?.read(offset: 0, length: readSize, queue: readQueue, ioHandler: childProcessRead)
     }
@@ -227,14 +287,21 @@ public class LocalProcess {
     var childMonitor: DispatchSourceProcess?
 #endif
 
+    deinit {
+#if os(macOS)
+        childMonitor?.cancel()
+        childMonitor = nil
+#endif
+    }
+
     func processTerminated ()
     {
         var n: Int32 = 0
         waitpid (shellPid, &n, WNOHANG)
         delegate?.processTerminated(self, exitCode: n)
-        running = false
+        childStopped()
     }
-    
+
     /// Indicates if the child process is currently running
     public private(set) var running: Bool = false
     
@@ -328,7 +395,7 @@ public class LocalProcess {
                     
                     // Process completed
                     await MainActor.run {
-                        self.running = false
+                        childStopped()
                         let exitCode: Int32?
                         switch result.terminationStatus {
                         case .exited(let code):
@@ -338,10 +405,10 @@ public class LocalProcess {
                         }
                         self.delegate?.processTerminated(self, exitCode: exitCode)
                     }
-                    
+
                 } catch {
                     await MainActor.run {
-                        self.running = false  
+                        childStopped()
                         self.delegate?.processTerminated(self, exitCode: nil)
                     }
                     print("Failed to start process with swift-subprocess: \(error)")
@@ -349,7 +416,7 @@ public class LocalProcess {
             }
             
         } catch {
-            running = false
+            childStopped()
             delegate?.processTerminated(self, exitCode: nil)
             print("Failed to create pseudo-terminal: \(error)")
         }
@@ -429,7 +496,7 @@ public class LocalProcess {
             kill(shellPid, SIGTERM)
         }
 
-        running = false
+        childStopped()
     }
     
     var loggingDir: String? = nil

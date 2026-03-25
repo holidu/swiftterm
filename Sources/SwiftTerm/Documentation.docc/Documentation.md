@@ -45,6 +45,8 @@ testing, and screen-scraping terminal output.
 - Mouse event reporting (X10, SGR, UTF-8, URxvt protocols)
 - Terminal resizing (local and remote-initiated)
 - Hyperlink support (OSC 8)
+- Configurable Apple view link tracking via ``LinkReporting`` (explicit OSC 8 and implicit URL detection)
+- Optional GPU-accelerated rendering via Metal (macOS, iOS, visionOS)
 - Graphics: Sixel, iTerm2-style inline images, and Kitty graphics protocol
 - Selection and search with a built-in macOS find bar and programmable search APIs
 - Thread-safe ``Terminal`` instances
@@ -79,6 +81,7 @@ testing, and screen-scraping terminal output.
 ### Guides
 
 - <doc:Customization>
+- <doc:GPURendering>
 - <doc:GraphicsSupport>
 - <doc:SSHIntegration>
 
@@ -110,6 +113,11 @@ testing, and screen-scraping terminal output.
 - ``SelectionService``
 - ``SearchService``
 - ``SearchOptions``
+
+### GPU Rendering
+
+- ``MetalBufferingMode``
+- ``MetalError``
 
 ### Graphics
 

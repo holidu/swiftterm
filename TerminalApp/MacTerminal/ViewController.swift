@@ -116,6 +116,27 @@ class ViewController: NSViewController, LocalProcessTerminalViewDelegate, NSUser
     override func viewDidLoad() {
         super.viewDidLoad()
         terminal = LocalProcessTerminalView(frame: view.frame)
+        terminal.metalBufferingMode = .perFrameAggregated
+        do {
+            try terminal.setUseMetal(false)
+        } catch {
+            print("METAL DISABLED: \(error)")
+        }
+        let defaultForegroundColor = NSColor(
+            calibratedRed: CGFloat(0xcc) / 255.0,
+            green: CGFloat(0xcc) / 255.0,
+            blue: CGFloat(0xcc) / 255.0,
+            alpha: 1.0
+        )
+        let defaultBackgroundColor = NSColor(
+            calibratedRed: CGFloat(0x28) / 255.0,
+            green: CGFloat(0x2c) / 255.0,
+            blue: CGFloat(0x34) / 255.0,
+            alpha: 1.0
+        )
+        terminal.nativeForegroundColor = defaultForegroundColor
+        terminal.nativeBackgroundColor = defaultBackgroundColor
+        terminal.layer?.backgroundColor = defaultBackgroundColor.cgColor
         terminal.caretColor = .systemGreen
         terminal.getTerminal().setCursorStyle(.steadyBlock)
         zoomGesture = NSMagnificationGestureRecognizer(target: self, action: #selector(zoomGestureHandler))
@@ -249,6 +270,23 @@ class ViewController: NSViewController, LocalProcessTerminalViewDelegate, NSUser
     }
 
     @objc @IBAction
+    func toggleMetalRenderer(_ source: AnyObject) {
+        do {
+            try terminal.setUseMetal(!terminal.isUsingMetalRenderer)
+        } catch {
+            print("METAL TOGGLE FAILED: \(error)")
+        }
+        terminal.setNeedsDisplay(terminal.bounds)
+    }
+
+    @objc @IBAction
+    func toggleMetalBufferingMode(_ source: AnyObject) {
+        let current = terminal.metalBufferingMode
+        terminal.metalBufferingMode = (current == .perRowPersistent) ? .perFrameAggregated : .perRowPersistent
+        terminal.setNeedsDisplay(terminal.bounds)
+    }
+
+    @objc @IBAction
     func allowMouseReporting (_ source: AnyObject)
     {
         terminal.allowMouseReporting.toggle ()
@@ -258,6 +296,13 @@ class ViewController: NSViewController, LocalProcessTerminalViewDelegate, NSUser
     func toggleCustomBlockGlyphs (_ source: AnyObject)
     {
         terminal.customBlockGlyphs.toggle()
+    }
+
+    @objc @IBAction
+    func toggleAnsi256PaletteStrategy (_ source: AnyObject)
+    {
+        let term = terminal.getTerminal()
+        term.ansi256PaletteStrategy = term.ansi256PaletteStrategy == .base16Lab ? .xterm : .base16Lab
     }
     
     @objc @IBAction
@@ -408,9 +453,25 @@ class ViewController: NSViewController, LocalProcessTerminalViewDelegate, NSUser
                 m.state = terminal.customBlockGlyphs ? NSControl.StateValue.on : NSControl.StateValue.off
             }
         }
+        if item.action == #selector(toggleAnsi256PaletteStrategy(_:)) {
+            if let m = item as? NSMenuItem {
+                let term = terminal.getTerminal()
+                m.state = term.ansi256PaletteStrategy == .base16Lab ? NSControl.StateValue.on : NSControl.StateValue.off
+            }
+        }
         if item.action == #selector(toggleOptionAsMetaKey(_:)) {
             if let m = item as? NSMenuItem {
                 m.state = terminal.optionAsMetaKey ? NSControl.StateValue.on : NSControl.StateValue.off
+            }
+        }
+        if item.action == #selector(toggleMetalRenderer(_:)) {
+            if let m = item as? NSMenuItem {
+                m.state = terminal.isUsingMetalRenderer ? .on : .off
+            }
+        }
+        if item.action == #selector(toggleMetalBufferingMode(_:)) {
+            if let m = item as? NSMenuItem {
+                m.state = terminal.metalBufferingMode == .perFrameAggregated ? .on : .off
             }
         }
         
