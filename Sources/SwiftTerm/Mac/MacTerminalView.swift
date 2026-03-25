@@ -1262,7 +1262,11 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
               let scalar = chars.unicodeScalars.first else {
             return nil
         }
-        if event.modifierFlags.contains(.numericPad) {
+        // macOS sets .numericPad for regular arrow keys (keyCodes 123-126),
+        // not just actual numpad keys. Only map to keypad variants when the
+        // keyCode is in the real numeric keypad range (0x41-0x5C).
+        let isRealNumpadKey = (0x41...0x5C).contains(Int(event.keyCode))
+        if event.modifierFlags.contains(.numericPad) && isRealNumpadKey {
             switch Int(scalar.value) {
             case NSUpArrowFunctionKey:
                 return .keypadUp
