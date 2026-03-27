@@ -5562,12 +5562,16 @@ open class Terminal {
         #if APP_DEBUG
         let start = CFAbsoluteTimeGetCurrent()
         #endif
-        let copy = Buffer(cols: source.cols, rows: source.rows, tabStopWidth: tabStopWidth, scrollback: source.scrollback)
-        copy.xDisp = source.xDisp
-        copy.yDisp = source.yDisp
-        copy.xBase = source.xBase
+        // Only copy visible lines (yDisp..yDisp+rows) instead of the entire
+        // scrollback buffer. Synchronized output only needs the visible frame
+        // for tear-free rendering — the scrollback is never displayed during
+        // the sync window. This reduces copy time from O(scrollback) to O(rows).
+        let copy = Buffer(cols: source.cols, rows: source.rows, tabStopWidth: tabStopWidth, scrollback: 0)
+        copy.xDisp = 0  // visible-only buffer starts at 0
+        copy.yDisp = 0
+        copy.xBase = 0
         copy.linesTop = source.linesTop
-        copy.yBase = source.yBase
+        copy.yBase = 0
         copy.x = source.x
         copy.y = source.y
         copy.scrollTop = source.scrollTop
@@ -5583,14 +5587,17 @@ open class Terminal {
         copy.marginRight = source.marginRight
         copy.savedAttr = source.savedAttr
         copy.savedCharset = source.savedCharset
-        copy.scrollback = source.scrollback
+        copy.scrollback = 0
 
-        for idx in 0..<source.lines.count {
+        let visibleStart = source.yDisp
+        let visibleEnd = min(visibleStart + source.rows, source.lines.count)
+        for idx in visibleStart..<visibleEnd {
             copy.lines.push(BufferLine(from: source.lines[idx]))
         }
         #if APP_DEBUG
         let elapsed = (CFAbsoluteTimeGetCurrent() - start) * 1000
-        STDebugLog.shared.log("[\(debugLabel ?? "unknown")] snapshotBuffer: copied \(source.lines.count) lines in \(String(format: "%.2f", elapsed))ms, scrollback=\(options.scrollback)")
+        let total = source.lines.count
+        STDebugLog.shared.log("[\(debugLabel ?? "unknown")] snapshotBuffer: copied \(visibleEnd - visibleStart)/\(total) lines in \(String(format: "%.2f", elapsed))ms")
         #endif
         return copy
     }
