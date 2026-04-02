@@ -9,6 +9,35 @@
 // TODO: audit every location to use restrictCursor
 
 import Foundation
+#if APP_DEBUG
+/// File-based debug logger for SwiftTerm sync output diagnostics.
+/// Writes to ~/Library/Logs/SwiftTerm-debug.log
+final class STDebugLog {
+    static let shared = STDebugLog()
+    private let handle: FileHandle?
+    private let queue = DispatchQueue(label: "com.holidu.SwiftTerm.debugLog")
+
+    private init() {
+        let path = (NSHomeDirectory() as NSString).appendingPathComponent("Library/Logs/SwiftTerm-debug.log")
+        FileManager.default.createFile(atPath: path, contents: nil)
+        handle = FileHandle(forWritingAtPath: path)
+        handle?.seekToEndOfFile()
+        let ts = ISO8601DateFormatter().string(from: Date())
+        if let data = "[\(ts)] SwiftTerm debug log started\n".data(using: .utf8) {
+            handle?.write(data)
+        }
+    }
+
+    func log(_ message: String) {
+        queue.async { [weak self] in
+            let ts = ISO8601DateFormatter().string(from: Date())
+            if let data = "[\(ts)] \(message)\n".data(using: .utf8) {
+                self?.handle?.write(data)
+            }
+        }
+    }
+}
+#endif
 
 /**
  * The terminal delegate is a protocol that must be implemented by a class
@@ -317,6 +346,10 @@ open class Terminal {
     /// Terminal configuration options.
     /// Setup(isReset:) method should be called to apply changes
     public var options: TerminalOptions
+
+    /// Optional label for debug logging. Set by the host app to identify this terminal instance
+    /// (e.g. session ID, window name). Only used when APP_DEBUG is active.
+    public var debugLabel: String?
     
     // The current buffers
     var normalBuffer, altBuffer: Buffer
@@ -408,7 +441,10 @@ open class Terminal {
     var refreshEnd = -1
     var scrollInvariantRefreshStart = Int.max
     var scrollInvariantRefreshEnd = -1
-    var userScrolling = false
+    public var userScrolling = false
+    /// Timestamp of the last data feed from PTY (updated in `parse()`).
+    /// App code can poll this to detect when output stops.
+    public var lastFeedTimestamp: CFAbsoluteTime = 0
     var lineFeedMode = false
     
     // We do not implement smooth scrolling here, dubious value, but
@@ -3292,6 +3328,14 @@ open class Terminal {
     {
         cmdSoftReset()
     }
+
+    /// Performs post-resize cleanup without resetting terminal state.
+    /// Unlike softReset(), this preserves colors, modes, and character attributes
+    /// that programs (vim, tmux, etc.) may have set.
+    public func resizeCleanup ()
+    {
+        tdel?.showCursor(source: self)
+    }
     
     //
     // CSI Ps n  Device Status Report (DSR).
@@ -4690,6 +4734,7 @@ open class Terminal {
      */
     public func parse (buffer: ArraySlice<UInt8>)
     {
+        lastFeedTimestamp = CFAbsoluteTimeGetCurrent()
         parser.parse(data: buffer)
     }
      
@@ -5231,10 +5276,24 @@ open class Terminal {
         let wasActive = synchronizedOutputActive
         if !synchronizedOutputActive {
             synchronizedOutputActive = true
+            #if APP_DEBUG
+            let start = CFAbsoluteTimeGetCurrent()
+            #endif
             synchronizedOutputBuffer = snapshotBuffer(buffer)
+            #if APP_DEBUG
+            let elapsed = (CFAbsoluteTimeGetCurrent() - start) * 1000
+            STDebugLog.shared.log("[\(debugLabel ?? "unknown")] beginSyncOutput: snapshot \(String(format: "%.2f", elapsed))ms, lines=\(buffer.lines.count), scrollback=\(options.scrollback)")
+            #endif
             synchronizedOutputBufferIsAlternate = isCurrentBufferAlternate
         } else if synchronizedOutputBuffer == nil {
+            #if APP_DEBUG
+            let start = CFAbsoluteTimeGetCurrent()
+            #endif
             synchronizedOutputBuffer = snapshotBuffer(buffer)
+            #if APP_DEBUG
+            let elapsed = (CFAbsoluteTimeGetCurrent() - start) * 1000
+            STDebugLog.shared.log("[\(debugLabel ?? "unknown")] beginSyncOutput (re-snapshot): snapshot \(String(format: "%.2f", elapsed))ms, lines=\(buffer.lines.count), scrollback=\(options.scrollback)")
+            #endif
             synchronizedOutputBufferIsAlternate = isCurrentBufferAlternate
         }
         scheduleSynchronizedOutputTimeout()
@@ -5248,6 +5307,9 @@ open class Terminal {
         guard synchronizedOutputActive else {
             return
         }
+        #if APP_DEBUG
+        STDebugLog.shared.log("[\(debugLabel ?? "unknown")] endSyncOutput: refreshing rows 0..\(rows - 1), scrollback=\(options.scrollback)")
+        #endif
         synchronizedOutputActive = false
         synchronizedOutputBuffer = nil
         synchronizedOutputBufferIsAlternate = false
@@ -5260,10 +5322,16 @@ open class Terminal {
     private func scheduleSynchronizedOutputTimeout ()
     {
         synchronizedOutputTimeoutItem?.cancel()
+        #if APP_DEBUG
+        STDebugLog.shared.log("[\(debugLabel ?? "unknown")] scheduleSyncTimeout: \(synchronizedOutputTimeoutSeconds)s, scrollback=\(options.scrollback)")
+        #endif
         let workItem = DispatchWorkItem { [weak self] in
             guard let self, self.synchronizedOutputActive else {
                 return
             }
+            #if APP_DEBUG
+            STDebugLog.shared.log("[\(self.debugLabel ?? "unknown")] ⚠️ syncTimeout FIRED — forcing endSyncOutput, scrollback=\(self.options.scrollback)")
+            #endif
             self.endSynchronizedOutput()
         }
         synchronizedOutputTimeoutItem = workItem
@@ -5272,6 +5340,9 @@ open class Terminal {
 
     private func snapshotBuffer (_ source: Buffer) -> Buffer
     {
+        #if APP_DEBUG
+        let start = CFAbsoluteTimeGetCurrent()
+        #endif
         let copy = Buffer(cols: source.cols, rows: source.rows, tabStopWidth: tabStopWidth, scrollback: source.scrollback)
         copy.xDisp = source.xDisp
         copy.yDisp = source.yDisp
@@ -5298,6 +5369,10 @@ open class Terminal {
         for idx in 0..<source.lines.count {
             copy.lines.push(BufferLine(from: source.lines[idx]))
         }
+        #if APP_DEBUG
+        let elapsed = (CFAbsoluteTimeGetCurrent() - start) * 1000
+        STDebugLog.shared.log("[\(debugLabel ?? "unknown")] snapshotBuffer: copied \(source.lines.count) lines in \(String(format: "%.2f", elapsed))ms, scrollback=\(options.scrollback)")
+        #endif
         return copy
     }
 

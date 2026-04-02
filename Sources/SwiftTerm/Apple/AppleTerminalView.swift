@@ -7,6 +7,9 @@
 //
 #if os(macOS) || os(iOS) || os(visionOS)
 import Foundation
+#if APP_DEBUG
+// STDebugLog is defined in Terminal.swift and shared across the module
+#endif
 import CoreGraphics
 import CoreText
 #if canImport(ImageIO)
@@ -96,14 +99,19 @@ extension TerminalView {
         // Calculation assume that all glyphs in the font have the same advancement.
         // Get the ascent + descent + leading from the font, already scaled for the font's size
         self.cellDimension = computeFontDimensions ()
-        
-        let terminalOptions = TerminalOptions(cols: Int(width / cellDimension.width),
-                                              rows: Int(height / cellDimension.height))
-        
+
+        let newCols = Int(width / cellDimension.width)
+        let newRows = Int(height / cellDimension.height)
+
         if terminal == nil {
+            let terminalOptions = TerminalOptions(cols: newCols, rows: newRows)
             terminal = Terminal(delegate: self, options: terminalOptions)
         } else {
-            terminal.options = terminalOptions
+            // Preserve user-configured options (scrollback, cursorStyle, etc.)
+            // when updating cols/rows on resize. Creating a fresh TerminalOptions
+            // would reset scrollback to the default (500).
+            terminal.options.cols = newCols
+            terminal.options.rows = newRows
             terminal.setup(isReset: false)
         }
         terminal.backgroundColor = Color.defaultBackground
@@ -1308,6 +1316,9 @@ extension TerminalView {
     {
         updateCursorPosition()
         guard let (rowStart, rowEnd) = terminal.getUpdateRange () else {
+            #if APP_DEBUG
+            STDebugLog.shared.log("[\(terminal.debugLabel ?? "unknown")] updateDisplay: getUpdateRange() nil (no dirty rows), scrollback=\(terminal.options.scrollback)")
+            #endif
             if notifyUpdateChanges {
                 let buffer = terminal.displayBuffer
                 let y = buffer.yDisp+buffer.y
@@ -1400,6 +1411,9 @@ extension TerminalView {
     func queuePendingDisplay ()
     {
         // throttle
+        #if APP_DEBUG
+        let wasAlreadyPending = pendingDisplay
+        #endif
         if !pendingDisplay {
             let fps60 = 16670000
             // let fps30 = 16670000*2
@@ -1409,6 +1423,11 @@ extension TerminalView {
                 deadline: DispatchTime (uptimeNanoseconds: DispatchTime.now().uptimeNanoseconds + UInt64 (fpsDelay)),
                 execute: updateDisplay)
         }
+        #if APP_DEBUG
+        if wasAlreadyPending {
+            STDebugLog.shared.log("[\(terminal.debugLabel ?? "unknown")] queuePendingDisplay: SKIPPED (already pending), scrollback=\(terminal.options.scrollback)")
+        }
+        #endif
     }
     
     ///
@@ -1570,7 +1589,7 @@ extension TerminalView {
     func feedPrepare()
     {
         search.invalidate()
-        selection.active = false
+        // selection.active = false  // Preserve selection during streaming output
         startDisplayUpdates()
     }
     
@@ -1603,7 +1622,7 @@ extension TerminalView {
     {
         terminal.resize (cols: cols, rows: rows)
         sizeChanged (source: terminal)
-        terminal.softReset()
+        terminal.resizeCleanup()
     }
     
     /**

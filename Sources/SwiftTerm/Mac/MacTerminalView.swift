@@ -451,7 +451,7 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     }
     
     open func linefeed(source: Terminal) {
-        selection.selectNone()
+        // selection.selectNone()  // Preserve selection during linefeed
     }
     
     /// This vaiable controls whether mouse events are sent to the application running under the
@@ -1366,6 +1366,19 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     
     public override func scrollWheel(with event: NSEvent) {
         if event.deltaY == 0 {
+            return
+        }
+        if allowMouseReporting && terminal.mouseMode != .off {
+            let button = event.deltaY > 0 ? 4 : 5
+            let flags = terminal.encodeButton(
+                button: button, release: false,
+                shift: event.modifierFlags.contains(.shift),
+                meta: event.modifierFlags.contains(.option),
+                control: event.modifierFlags.contains(.control))
+            let hit = calculateMouseHit(with: event)
+            let displayBuffer = terminal.displayBuffer
+            let screenRow = max(0, min(displayBuffer.rows - 1, hit.grid.row - displayBuffer.yDisp))
+            terminal.sendEvent(buttonFlags: flags, x: hit.grid.col, y: screenRow, pixelX: hit.pixels.col, pixelY: hit.pixels.row)
             return
         }
         let velocity = calcScrollingVelocity(delta: Int (abs (event.deltaY)))

@@ -59,9 +59,9 @@ let targets: [Target] = [
 //        ],
         path: "Sources/SwiftTerm",
         exclude: platformExcludes + ["Mac/README.md"],
-//        swiftSettings: [
-//            .unsafeFlags(["-enforce-exclusivity=none"])
-//        ]
+        swiftSettings: [
+            .define("APP_DEBUG", .when(configuration: .debug))
+        ]
     ),
     .executableTarget (
         name: "SwiftTermFuzz",
