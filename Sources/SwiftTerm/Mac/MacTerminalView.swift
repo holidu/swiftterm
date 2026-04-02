@@ -2151,10 +2151,9 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         }
         updateHoverLink(at: hit.grid)
         
-        if allowMouseReporting && terminal.mouseMode.sendMotionEvent() {
-            let flags = encodeMouseEvent(with: event, overwriteRelease: true)
-            terminal.sendMotion(buttonFlags: flags, x: hit.grid.col, y: hit.grid.row, pixelX: hit.pixels.col, pixelY: hit.pixels.row)
-        }
+        // Motion reporting on hover disabled — it encodes as a button-release
+        // which applications (e.g. Claude Code) misinterpret as a click.
+        // Click, drag, and scroll are reported through their own handlers.
     }
     
     public override func scrollWheel(with event: NSEvent) {
