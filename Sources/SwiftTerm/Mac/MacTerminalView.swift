@@ -135,6 +135,8 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
 #endif
 
     var cellDimension: CellDimension!
+    /// Accumulated fractional scroll delta for smooth trackpad scrolling
+    private var scrollAccumulator: CGFloat = 0
     var caretView: CaretView!
     public var terminal: Terminal!
     private var progressBarView: TerminalProgressBarView?
@@ -2157,27 +2159,44 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     }
     
     public override func scrollWheel(with event: NSEvent) {
-        if event.deltaY == 0 {
-            return
+        let deltaY = event.scrollingDeltaY
+        if deltaY == 0 { return }
+
+        // Reset accumulator on new scroll gesture (non-momentum, non-precise phase)
+        if event.phase == .began {
+            scrollAccumulator = 0
         }
+
+        guard let cellH = cellDimension?.height, cellH > 0 else { return }
+
+        // Accumulate pixel deltas and convert to whole-line steps
+        scrollAccumulator += deltaY
+        let lines = Int(scrollAccumulator / cellH)
+        if lines == 0 { return }
+        scrollAccumulator -= CGFloat(lines) * cellH
+
         if allowMouseReporting && terminal.mouseMode != .off {
-            let button = event.deltaY > 0 ? 4 : 5
+            let hit = calculateMouseHit(with: event)
+            let displayBuffer = terminal.displayBuffer
+            let screenRow = max(0, min(displayBuffer.rows - 1, hit.grid.row - displayBuffer.yDisp))
+            let button = lines > 0 ? 4 : 5
             let flags = terminal.encodeButton(
                 button: button, release: false,
                 shift: event.modifierFlags.contains(.shift),
                 meta: event.modifierFlags.contains(.option),
                 control: event.modifierFlags.contains(.control))
-            let hit = calculateMouseHit(with: event)
-            let displayBuffer = terminal.displayBuffer
-            let screenRow = max(0, min(displayBuffer.rows - 1, hit.grid.row - displayBuffer.yDisp))
-            terminal.sendEvent(buttonFlags: flags, x: hit.grid.col, y: screenRow, pixelX: hit.pixels.col, pixelY: hit.pixels.row)
+            let count = min(abs(lines), 5)
+            for _ in 0..<count {
+                terminal.sendEvent(buttonFlags: flags, x: hit.grid.col, y: screenRow, pixelX: hit.pixels.col, pixelY: hit.pixels.row)
+            }
             return
         }
-        let velocity = calcScrollingVelocity(delta: Int (abs (event.deltaY)))
-        if event.deltaY > 0 {
-            scrollUp (lines: velocity)
+
+        let absLines = abs(lines)
+        if lines > 0 {
+            scrollUp(lines: absLines)
         } else {
-            scrollDown(lines: velocity)
+            scrollDown(lines: absLines)
         }
     }
     
