@@ -2162,7 +2162,7 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         let deltaY = event.scrollingDeltaY
         if deltaY == 0 { return }
 
-        // Reset accumulator on new scroll gesture (non-momentum, non-precise phase)
+        // Reset accumulator on new scroll gesture
         if event.phase == .began {
             scrollAccumulator = 0
         }
@@ -2175,6 +2175,8 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         if lines == 0 { return }
         scrollAccumulator -= CGFloat(lines) * cellH
 
+        let absLines = abs(lines)
+
         if allowMouseReporting && terminal.mouseMode != .off {
             let hit = calculateMouseHit(with: event)
             let displayBuffer = terminal.displayBuffer
@@ -2185,18 +2187,18 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
                 shift: event.modifierFlags.contains(.shift),
                 meta: event.modifierFlags.contains(.option),
                 control: event.modifierFlags.contains(.control))
-            let count = min(abs(lines), 5)
-            for _ in 0..<count {
+            for _ in 0..<absLines {
                 terminal.sendEvent(buttonFlags: flags, x: hit.grid.col, y: screenRow, pixelX: hit.pixels.col, pixelY: hit.pixels.row)
             }
             return
         }
 
-        let absLines = abs(lines)
+        // Normal scrollback with velocity: apply acceleration for fast scrolls
+        let velocity = calcScrollingVelocity(delta: absLines)
         if lines > 0 {
-            scrollUp(lines: absLines)
+            scrollUp(lines: velocity)
         } else {
-            scrollDown(lines: absLines)
+            scrollDown(lines: velocity)
         }
     }
     
