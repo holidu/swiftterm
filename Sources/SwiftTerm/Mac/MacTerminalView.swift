@@ -2187,7 +2187,10 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
                 shift: event.modifierFlags.contains(.shift),
                 meta: event.modifierFlags.contains(.option),
                 control: event.modifierFlags.contains(.control))
-            for _ in 0..<absLines {
+            // Cap reports: applications may multiply each report by a scroll speed
+            // factor (e.g. CLAUDE_CODE_SCROLL_SPEED=3), so fewer reports = smoother feel.
+            let count = min(absLines, 3)
+            for _ in 0..<count {
                 terminal.sendEvent(buttonFlags: flags, x: hit.grid.col, y: screenRow, pixelX: hit.pixels.col, pixelY: hit.pixels.row)
             }
             return
