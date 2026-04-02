@@ -137,6 +137,8 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     var cellDimension: CellDimension!
     /// Accumulated fractional scroll delta for smooth trackpad scrolling
     private var scrollAccumulator: CGFloat = 0
+    /// Max mouse scroll reports per event — configurable by host app (default 3)
+    public var mouseScrollReportCap: Int = 3
     var caretView: CaretView!
     public var terminal: Terminal!
     private var progressBarView: TerminalProgressBarView?
@@ -2187,9 +2189,7 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
                 shift: event.modifierFlags.contains(.shift),
                 meta: event.modifierFlags.contains(.option),
                 control: event.modifierFlags.contains(.control))
-            // Cap reports: applications may multiply each report by a scroll speed
-            // factor (e.g. CLAUDE_CODE_SCROLL_SPEED=3), so fewer reports = smoother feel.
-            let count = min(absLines, 3)
+            let count = min(absLines, mouseScrollReportCap)
             for _ in 0..<count {
                 terminal.sendEvent(buttonFlags: flags, x: hit.grid.col, y: screenRow, pixelX: hit.pixels.col, pixelY: hit.pixels.row)
             }
