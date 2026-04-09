@@ -1912,8 +1912,11 @@ extension TerminalView {
     func feedPrepare()
     {
         search.invalidate()
-        // Preserve manual selection while output is streaming when mouse reporting is disabled.
-        if allowMouseReporting {
+        // Preserve manual selection while output is streaming unless the running
+        // application has actually requested mouse tracking.  Checking mouseMode
+        // prevents selection from being cleared on every feed when no program has
+        // enabled mouse events (e.g. normal shell output without a TUI).
+        if allowMouseReporting && terminal.mouseMode != .off {
             selection.active = false
         }
         startDisplayUpdates()
