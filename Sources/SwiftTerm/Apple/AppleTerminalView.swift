@@ -1589,53 +1589,58 @@ extension TerminalView {
         terminal.clearUpdateRange ()
                 
         #if os(macOS)
-        let baseLine = frame.height
-        var region = CGRect (x: 0,
-                             y: baseLine - (cellDimension.height + CGFloat(rowEnd) * cellDimension.height),
-                             width: frame.width,
-                             height: CGFloat(rowEnd-rowStart + 1) * cellDimension.height)
-        
-        // If we are the last line, we should also queue a refresh for the "remaining" bits at the
-        // end which can be redrawn by large unicode
-        if rowEnd == terminal.rows - 1 {
-            let oh = region.height
-            let oy = region.origin.y
-            region = CGRect (x: 0, y: 0, width: frame.width, height: oh + oy)
-        }
+        // Convert the active-area dirty rows to on-screen viewport rows. While the user has
+        // scrolled up (yDisp != yBase) these differ; skip the repaint when the changed rows
+        // are not currently visible (scrolling back triggers a full repaint of the viewport).
+        if let (viewportStart, viewportEnd) = terminal.visibleRowRange (activeStart: rowStart, activeEnd: rowEnd) {
+            let baseLine = frame.height
+            var region = CGRect (x: 0,
+                                 y: baseLine - (cellDimension.height + CGFloat(viewportEnd) * cellDimension.height),
+                                 width: frame.width,
+                                 height: CGFloat(viewportEnd - viewportStart + 1) * cellDimension.height)
+
+            // If we are the last line, we should also queue a refresh for the "remaining" bits at the
+            // end which can be redrawn by large unicode
+            if viewportEnd == terminal.rows - 1 {
+                let oh = region.height
+                let oy = region.origin.y
+                region = CGRect (x: 0, y: 0, width: frame.width, height: oh + oy)
+            }
 #if canImport(MetalKit)
-        if metalView != nil {
-            let buffer = terminal.displayBuffer
-            if buffer.lines.count == 0 {
-                metalDirtyRange = nil
-            } else {
-                let maxRow = buffer.lines.count - 1
-                let visibleStart = buffer.yDisp
-                let visibleEnd = min(maxRow, buffer.yDisp + buffer.rows - 1)
-                if rowStart >= 0 && rowEnd >= rowStart && rowEnd < terminal.rows {
-                    let absStart = buffer.yDisp + rowStart
-                    let absEnd = buffer.yDisp + rowEnd
-                    let clampedStart = max(0, min(absStart, maxRow))
-                    let clampedEnd = max(0, min(absEnd, maxRow))
-                    if clampedStart <= clampedEnd {
-                        metalDirtyRange = clampedStart...clampedEnd
+            if metalView != nil {
+                let buffer = terminal.displayBuffer
+                if buffer.lines.count == 0 {
+                    metalDirtyRange = nil
+                } else {
+                    let maxRow = buffer.lines.count - 1
+                    let visibleStart = buffer.yDisp
+                    let visibleEnd = min(maxRow, buffer.yDisp + buffer.rows - 1)
+                    if rowStart >= 0 && rowEnd >= rowStart && rowEnd < terminal.rows {
+                        let absStart = buffer.yBase + rowStart
+                        let absEnd = buffer.yBase + rowEnd
+                        let clampedStart = max(0, min(absStart, maxRow))
+                        let clampedEnd = max(0, min(absEnd, maxRow))
+                        if clampedStart <= clampedEnd {
+                            metalDirtyRange = clampedStart...clampedEnd
+                        } else if visibleStart <= visibleEnd {
+                            metalDirtyRange = visibleStart...visibleEnd
+                        } else {
+                            metalDirtyRange = nil
+                        }
                     } else if visibleStart <= visibleEnd {
                         metalDirtyRange = visibleStart...visibleEnd
                     } else {
                         metalDirtyRange = nil
                     }
-                } else if visibleStart <= visibleEnd {
-                    metalDirtyRange = visibleStart...visibleEnd
-                } else {
-                    metalDirtyRange = nil
                 }
+                requestMetalDisplay()
+            } else {
+                setNeedsDisplay(region)
             }
-            requestMetalDisplay()
-        } else {
-            setNeedsDisplay(region)
-        }
 #else
-        setNeedsDisplay(region)
+            setNeedsDisplay(region)
 #endif
+        }
         #else
         // TODO iOS: need to update the code above, but will do that when I get some real
         // life data being fed into it.

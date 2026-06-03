@@ -4959,7 +4959,9 @@ open class Terminal {
     func updateRange (_ y: Int, scrolling: Bool = false)
     {        
         if !scrolling {
-            let effectiveY = buffer._yDisp + y
+            // Absolute buffer line of the change is yBase + y (not yDisp + y,
+            // which is wrong whenever the user has scrolled up).
+            let effectiveY = buffer.yBase + y
             if effectiveY >= 0 {
                 if effectiveY < scrollInvariantRefreshStart {
                     scrollInvariantRefreshStart = effectiveY
@@ -4983,7 +4985,9 @@ open class Terminal {
     func updateRange (borrowing buffer: borrowing Buffer, _ y: Int, scrolling: Bool = false)
     {
         if !scrolling {
-            let effectiveY = buffer._yDisp + y
+            // Absolute buffer line of the change is yBase + y (not yDisp + y,
+            // which is wrong whenever the user has scrolled up).
+            let effectiveY = buffer.yBase + y
             if effectiveY >= 0 {
                 if effectiveY < scrollInvariantRefreshStart {
                     scrollInvariantRefreshStart = effectiveY
@@ -5015,8 +5019,8 @@ open class Terminal {
         refreshStart = 0
         refreshEnd = rows
         
-        scrollInvariantRefreshStart = buffer.yDisp
-        scrollInvariantRefreshEnd = buffer.yDisp + rows
+        scrollInvariantRefreshStart = buffer.yBase
+        scrollInvariantRefreshEnd = buffer.yBase + rows
     }
     
     /**
@@ -5102,9 +5106,32 @@ open class Terminal {
     {
         refreshStart = Int.max
         refreshEnd = -1
-        
+
         scrollInvariantRefreshStart = Int.max
         scrollInvariantRefreshEnd = -1
+    }
+
+    /**
+     * Maps an active-area row range, as returned by `getUpdateRange()` where row 0 is the top
+     * of the active screen area (absolute buffer line `buffer.yBase`), into the range of
+     * on-screen viewport rows that must be repainted.
+     *
+     * An active-area row `y` corresponds to absolute buffer line `yBase + y`, while a viewport
+     * row `v` corresponds to absolute buffer line `yDisp + v`. The two coincide only when the
+     * viewport is pinned to the bottom (`yDisp == yBase`); when the user has scrolled up, freshly
+     * written rows live `yBase - yDisp` rows lower in the viewport and may be scrolled out of
+     * view entirely.
+     *
+     * - Returns: the clamped viewport row range to repaint, or `nil` when the changed rows are
+     *   not currently visible.
+     */
+    func visibleRowRange (activeStart: Int, activeEnd: Int) -> (startY: Int, endY: Int)?
+    {
+        let scrollOffset = buffer.yBase - buffer.yDisp
+        let clampedStart = max (0, activeStart + scrollOffset)
+        let clampedEnd = min (rows - 1, activeEnd + scrollOffset)
+        guard clampedStart <= clampedEnd else { return nil }
+        return (clampedStart, clampedEnd)
     }
     
     /**
