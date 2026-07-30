@@ -52,6 +52,12 @@ public extension Notification.Name {
  * defaults, otherwise, this uses its own set of defaults colors.
  */
 open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollViewDelegate, TerminalDelegate, UIPointerInteractionDelegate {
+    private enum PendingKoreanResyllabificationResult {
+        case none
+        case prefixReinserted
+        case completed
+    }
+
     public static var textInputDebugEnabled: Bool = ProcessInfo.processInfo.environment["SWIFTTERM_TEXT_INPUT_DEBUG"] == "1"
     internal static var textInputLogCounter: Int = 0
 
@@ -191,12 +197,25 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
     var search: SearchService!
     var debug: UIView?
     var pendingDisplay: Bool = false
+    /// Output received shortly after local input is likely echo or prompt redraw;
+    /// render it without the 16.67ms frame-rate throttle so typing feels responsive.
+    var lastUserInputUptimeNs: UInt64 = 0
+    /// Guards lastUserInputUptimeNs, which is written on the main thread and
+    /// read from the (possibly background) feed thread.
+    let userInputLock = NSLock()
+    let interactiveInputDisplayWindowNs: UInt64 = 150_000_000
 #if canImport(MetalKit)
     var metalView: MTKView?
     var metalRenderer: MetalTerminalRenderer?
     var pendingMetalDisplay: Bool = false
     private var useMetalRenderer = false
     var metalDirtyRange: ClosedRange<Int>?
+    /// The cursor position last submitted to the Metal renderer. Used to
+    /// detect pure cursor-only moves (no rows dirty) such as the
+    /// CSI Ps C / CSI Ps D sequences shells emit in response to Option+Arrow
+    /// word jumps, which would otherwise leave the cursor visually stuck
+    /// because `MTKView` is paused and only redraws on demand.
+    var lastRenderedCursor: (x: Int, y: Int, hidden: Bool)?
 
     /// Whether the terminal view is currently using the Metal GPU renderer.
     ///
@@ -208,6 +227,7 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
 #endif
     var cellDimension: CellDimension
     var caretView: CaretView?
+    var _lineSpacing: CGFloat = 1.0
     var terminal: Terminal!
     private var progressBarView: TerminalProgressBarView?
     private var progressReportTimer: Timer?
@@ -236,6 +256,11 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
     // We use this as temporary storage for UITextInput, which we send to the terminal on demand
     var textInputStorage: String = ""
     var pendingAutoPeriodDeleteWasSpace: Bool = false
+    private var koreanResyllabificationTransaction = HangulInput.ResyllabificationTransaction()
+
+    func resetKoreanResyllabificationTransaction() {
+        koreanResyllabificationTransaction.reset()
+    }
 
     // This tracks the marked text, part of the UITextInput protocol, which is used to flag temporary data entry, that might
     // be removed afterwards by the input system (input methods will insert approximiations, mark and change on demand)
@@ -284,6 +309,9 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
         self.fontSet = FontSet (font: font ?? FontSet.defaultFont)
         cellDimension = CellDimension(width: 1, height: 1)
         super.init (frame: frame)
+        isAccessibilityElement = true
+        accessibilityTraits.formUnion([.staticText, .causesPageTurn])
+        accessibilityTextualContext = .sourceCode
         setup()
     }
     
@@ -292,6 +320,9 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
         self.fontSet = FontSet (font: FontSet.defaultFont)
         cellDimension = CellDimension(width: 1, height: 1)
         super.init (frame: frame)
+        isAccessibilityElement = true
+        accessibilityTraits.formUnion([.staticText, .causesPageTurn])
+        accessibilityTextualContext = .sourceCode
         setup()
     }
     
@@ -367,6 +398,14 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
             mtkView.framebufferOnly = true
             mtkView.colorPixelFormat = .bgra8Unorm
             mtkView.isUserInteractionEnabled = false
+            // Tag the metal layer with sRGB so the compositor color-manages our
+            // pixels the same way as a regular UIView's layer. Without this,
+            // CAMetalLayer is untagged and raw bytes are treated as
+            // already-in-display-gamut, oversaturating colors on wide-gamut
+            // displays.
+            if let metalLayer = mtkView.layer as? CAMetalLayer {
+                metalLayer.colorspace = CGColorSpace(name: CGColorSpace.sRGB)
+            }
             let renderer = try MetalTerminalRenderer(view: mtkView, terminalView: self)
             mtkView.delegate = renderer
             if let caretView = caretView {
@@ -657,7 +696,10 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
     func encodeFlags (release: Bool) -> Int
     {
         let encodedFlags = terminal.encodeButton(
-            button: 1,
+            // Outpost patch: taps/drags are the primary (left) button. Upstream
+            // hard-codes 1 (middle), so every tap arrives as a middle-click —
+            // vim pastes, and left-click targets in TUIs never fire. 0 = left.
+            button: 0,
             release: release,
             shift: false,
             meta: false,
@@ -690,11 +732,19 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
         contentOffset.y = max(0, CGFloat(lines) - bottomVisibleLine) * cellDimension.height
     }
     
+    /// Returns true when the user is holding Shift on an attached hardware keyboard
+    /// and the running application has not opted in to capturing shift via XTSHIFTESCAPE.
+    /// In that case the gesture should fall through to local selection handling instead
+    /// of being forwarded to the application as a mouse event.
+    private func shiftBypassesMouseReporting(for gestureRecognizer: UIGestureRecognizer) -> Bool {
+        gestureRecognizer.modifierFlags.contains(.shift) && !terminal.mouseShiftCapture
+    }
+
     @objc func singleTap (_ gestureRecognizer: UITapGestureRecognizer)
     {
         if isFirstResponder {
             guard gestureRecognizer.view != nil else { return }
-                 
+
             if gestureRecognizer.state != .ended {
                 return
             }
@@ -705,7 +755,7 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
                 return
             }
 
-            if allowMouseReporting && terminal.mouseMode.sendButtonPress() {
+            if allowMouseReporting && !shiftBypassesMouseReporting(for: gestureRecognizer) && terminal.mouseMode.sendButtonPress() {
                 sharedMouseEvent(gestureRecognizer: gestureRecognizer, release: false)
 
                 if terminal.mouseMode.sendButtonRelease() {
@@ -737,12 +787,12 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
     @objc func doubleTap (_ gestureRecognizer: UITapGestureRecognizer)
     {
         guard gestureRecognizer.view != nil else { return }
-               
+
         if gestureRecognizer.state != .ended {
             return
         }
-        
-        if allowMouseReporting && terminal.mouseMode.sendButtonPress() {
+
+        if allowMouseReporting && !shiftBypassesMouseReporting(for: gestureRecognizer) && terminal.mouseMode.sendButtonPress() {
             sharedMouseEvent(gestureRecognizer: gestureRecognizer, release: false)
             
             if terminal.mouseMode.sendButtonRelease() {
@@ -767,7 +817,7 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
             return
         }
 
-        if allowMouseReporting && terminal.mouseMode.sendButtonPress() {
+        if allowMouseReporting && !shiftBypassesMouseReporting(for: gestureRecognizer) && terminal.mouseMode.sendButtonPress() {
             sharedMouseEvent(gestureRecognizer: gestureRecognizer, release: false)
 
             if terminal.mouseMode.sendButtonRelease() {
@@ -863,7 +913,7 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
     
     @objc func panMouseHandler (_ gestureRecognizer: UIPanGestureRecognizer){
         guard gestureRecognizer.view != nil else { return }
-        if allowMouseReporting && terminal.mouseMode != .off {
+        if allowMouseReporting && !shiftBypassesMouseReporting(for: gestureRecognizer) && terminal.mouseMode != .off {
             switch gestureRecognizer.state {
             case .began:
                 // send the initial tap
@@ -1179,6 +1229,16 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
         setupOptions(width: bounds.width, height: bounds.height)
         layer.backgroundColor = nativeBackgroundColor.cgColor
         nativeBackgroundColor = UIColor.clear
+        // The terminal background is provided by `layer.backgroundColor`, and
+        // `draw(_:)` paints glyph cells with a transparent backdrop so that the
+        // layer colour shows through the gaps. That only works if the view is
+        // non-opaque: an opaque view gets an alpha-less graphics context where
+        // the transparent fill is a no-op, leaving uninitialised backing-store
+        // garbage in every default-background region. When the scroll view blits
+        // and re-exposes strips during scrolling, that garbage becomes visible as
+        // flickering/striped corruption. Marking the view non-opaque makes the
+        // transparent compositing behave as intended.
+        isOpaque = false
     }
     
     var _nativeFg, _nativeBg: TTColor!
@@ -1248,14 +1308,29 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
         }
     }
 
-    var _selectedTextBackgroundColor = UIColor (red: 204.0/255.0, green: 221.0/255.0, blue: 237.0/255.0, alpha: 1.0)
-    /// The color used to render the selection
+    var _selectedTextBackgroundColor = UIColor(red: 0, green: 166.0 / 255.0, blue: 178.0 / 255.0, alpha: 1.0)
+    /// The background color used to render the selection.
     public var selectedTextBackgroundColor: UIColor {
         get {
             return _selectedTextBackgroundColor
         }
         set {
             _selectedTextBackgroundColor = newValue
+            terminal.updateFullScreen()
+            queuePendingDisplay()
+        }
+    }
+
+    var _selectedTextForegroundColor = UIColor.black
+    /// The foreground color used to render selected text.
+    public var selectedTextForegroundColor: UIColor {
+        get {
+            return _selectedTextForegroundColor
+        }
+        set {
+            _selectedTextForegroundColor = newValue
+            terminal.updateFullScreen()
+            queuePendingDisplay()
         }
     }
     
@@ -1270,11 +1345,63 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
         }
     }
 
+    /// Whether the terminal currently has an active text selection.
+    ///
+    /// Exposed publicly so embedders (e.g. a UIScrollView subclass that
+    /// hosts the terminal) can veto their own gesture recognisers while
+    /// the user is dragging a selection handle. The underlying
+    /// `SelectionService` is intentionally `internal`; this read-only
+    /// accessor is the minimum public surface needed for the common
+    /// "don't scroll while I'm dragging the selection handle" pattern.
+    ///
+    /// Added by the meshTerm fork (`v1.13.0-meshterm.1`). An upstream
+    /// PR has been filed mirroring this accessor; once merged we will
+    /// switch back to upstream and drop the fork.
+    public var hasActiveSelection: Bool {
+        return selection?.active ?? false
+    }
+
+    /// Programmatically sets the selection range to the given buffer
+    /// positions. Useful for callers that want to highlight a region
+    /// without going through a drag gesture — e.g. a search overlay
+    /// that wants match cells to light up with the same visual
+    /// treatment as a user-driven selection. Coordinates are
+    /// buffer-relative `Position` values. The view's internal
+    /// selection rendering picks up the change automatically.
+    public func setSelectionRange(start: Position, end: Position) {
+        selection?.setSelection(start: start, end: end)
+    }
+
+    /// Clears any active selection. Companion to `setSelectionRange`
+    /// for callers that don't have a UIResponder hook into the menu
+    /// system (where `selectNone` would otherwise come from).
+    public func clearSelection() {
+        selection?.selectNone()
+    }
+
+    /// Programmatically presents SwiftTerm's standard Copy / Paste /
+    /// Select All context menu at the given point in the terminal's
+    /// coordinate space. Mirrors the path the built-in long-press
+    /// gesture takes — becomes first responder, computes the menu
+    /// region around the tap point, then calls the existing internal
+    /// `showContextMenu(forRegion:pos:)` presenter.
+    ///
+    /// Useful when a host app replaces the built-in long-press gesture
+    /// with custom behaviour (e.g. a cursor-drag mode) but still wants
+    /// the existing menu as a fallback for release-without-movement.
+    public func showStandardContextMenu(at point: CGPoint) {
+        _ = becomeFirstResponder()
+        let region = makeContextMenuRegionForTap(point: point)
+        let hit = calculateTapHit(point: point)
+        showContextMenu(forRegion: region, pos: hit.grid)
+    }
+
     var lineAscent: CGFloat = 0
     var lineDescent: CGFloat = 0
     var lineLeading: CGFloat = 0
     
     open func bufferActivated(source: Terminal) {
+        resetManualScrollTracking()
         updateScroller ()
     }
     
@@ -1367,8 +1494,27 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
         let displayBuffer = terminal.displayBuffer
         contentSize = CGSize (width: CGFloat (displayBuffer.cols) * cellDimension.width,
                               height: CGFloat (displayBuffer.lines.count) * cellDimension.height)
-        //contentOffset = CGPoint (x: 0, y: CGFloat (displayBuffer.lines.count-displayBuffer.rows)*cellDimension.height)
-        contentOffset = CGPoint (x: 0, y: CGFloat (displayBuffer.lines.count-displayBuffer.rows)*cellDimension.height)
+        // Let the gesture own contentOffset while the finger is physically down
+        // (isTracking), and while frozen history coasts under momentum —
+        // re-asserting it there fights the drag and blocks the user from reaching
+        // the bottom. But when following the bottom (userScrolling == false) we
+        // must keep pinning to the bottom even during deceleration: otherwise
+        // streaming output grows the content faster than the coasting offset, the
+        // tail pulls away, and the view falls behind the live output.
+        //
+        // NOTE: isTracking (finger down), not isDragging — on device isDragging
+        // stays true through the whole momentum coast, so it cannot distinguish
+        // an active drag from post-lift deceleration. contentSize is still
+        // updated above so the newly appended rows remain reachable.
+        if isTracking || (userScrolling && isDecelerating) {
+            return
+        }
+        let rowOffset = CGFloat (displayBuffer.yDisp) * cellDimension.height
+        let desiredY = userScrolling ? rowOffset + manualScrollOffsetWithinRow : rowOffset
+        // Clamp to the scroll view's real maximum so following the bottom rests
+        // flush against the last line instead of over-scrolling past it.
+        let offsetY = min(desiredY, maxContentOffsetY())
+        setContentOffsetFromTerminal(CGPoint (x: 0, y: offsetY))
         //Xscroller.doubleValue = scrollPosition
         //Xscroller.knobProportion = scrollThumbsize
     }
@@ -1393,6 +1539,106 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
 #endif
     
     var userScrolling = false
+    private var updatingContentOffsetFromTerminal = false
+    private var manualScrollOffsetWithinRow: CGFloat = 0
+
+    private var contentOffsetTolerance: CGFloat {
+        1 / max(backingScaleFactor(), 1)
+    }
+
+    private func maxDisplayRow(in displayBuffer: Buffer) -> Int {
+        max(0, displayBuffer.lines.count - displayBuffer.rows)
+    }
+
+    /// The largest resting `contentOffset.y` the scroll view can actually reach.
+    /// This is smaller than `maxDisplayRow * cellHeight` by the partial-row
+    /// remainder whenever the viewport height is not an exact multiple of the
+    /// cell height, so it — not the row offset — is the true "bottom" of the
+    /// content for both follow-mode positioning and at-bottom detection. The
+    /// `adjustedContentInset.bottom` term matches UIScrollView's own clamp: with
+    /// a bottom inset (accessory view, safe area, keyboard) the resting maximum
+    /// shifts, and ignoring it left the user unable to ever reach the bottom to
+    /// disengage the freeze — even by overscrolling.
+    private func maxContentOffsetY() -> CGFloat {
+        max(0, contentSize.height - bounds.height + adjustedContentInset.bottom)
+    }
+
+    private func setContentOffsetFromTerminal(_ newContentOffset: CGPoint) {
+        if abs(contentOffset.x - newContentOffset.x) <= contentOffsetTolerance &&
+            abs(contentOffset.y - newContentOffset.y) <= contentOffsetTolerance {
+            return
+        }
+
+        updatingContentOffsetFromTerminal = true
+        contentOffset = newContentOffset
+        updatingContentOffsetFromTerminal = false
+    }
+
+    private func setManualScrolling(_ enabled: Bool) {
+        userScrolling = enabled
+        terminal.userScrolling = enabled
+        if !enabled {
+            manualScrollOffsetWithinRow = 0
+        }
+    }
+
+    func resetManualScrollOffsetWithinRow() {
+        manualScrollOffsetWithinRow = 0
+    }
+
+    private func resetManualScrollTracking() {
+        setManualScrolling(false)
+
+        let displayBuffer = terminal.displayBuffer
+        terminal.setViewYDisp(maxDisplayRow(in: displayBuffer))
+        let bottomOffset = min(CGFloat(displayBuffer.yDisp) * cellDimension.height, maxContentOffsetY())
+        setContentOffsetFromTerminal(CGPoint(x: 0, y: bottomOffset))
+    }
+
+    private func syncYDispFromContentOffset() {
+        guard terminal != nil, !updatingContentOffsetFromTerminal, cellDimension.height > 0 else {
+            return
+        }
+
+        let displayBuffer = terminal.displayBuffer
+        let maxRow = maxDisplayRow(in: displayBuffer)
+        let maxContentOffset = maxContentOffsetY()
+        let offsetY = min(max(contentOffset.y, 0), maxContentOffset)
+
+        // A drag that lands within half a row of the bottom (or overscrolls past
+        // it) re-engages auto-follow. A sub-pixel tolerance was too tight —
+        // fractional cell heights and contentInset rounding left the user a hair
+        // short of the exact maximum, so the freeze never disengaged.
+        let atBottomThreshold = max(contentOffsetTolerance, cellDimension.height / 2)
+        if offsetY >= maxContentOffset - atBottomThreshold {
+            if displayBuffer.yDisp != maxRow {
+                terminal.setViewYDisp(maxRow)
+            }
+            setManualScrolling(false)
+            return
+        }
+
+        // Freeze auto-follow only while the finger is physically down
+        // (isTracking). Excluding the momentum coast is essential: after the
+        // finger lifts, deceleration keeps firing sync while streaming output
+        // extends the content and the bottom recedes ahead of the coasting
+        // offset — treating that "not at the bottom yet" reading as a manual
+        // scroll would re-freeze a view the user just flung to the bottom. This
+        // must key off isTracking, not isDragging: on device isDragging stays
+        // true through the entire coast, so it fails to exclude momentum. It also
+        // covers layout/system-driven offset changes (startup sizing, rotation,
+        // keyboard insets, buffer shrink), which are never a manual scroll.
+        guard isTracking else {
+            return
+        }
+
+        let row = max(0, min(maxRow, Int(floor((offsetY + contentOffsetTolerance) / cellDimension.height))))
+        manualScrollOffsetWithinRow = offsetY - CGFloat(row) * cellDimension.height
+        if displayBuffer.yDisp != row {
+            terminal.setViewYDisp(row)
+        }
+        setManualScrolling(true)
+    }
 
     func getCurrentGraphicsContext () -> CGContext?
     {
@@ -1473,12 +1719,38 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
 
     open override var contentOffset: CGPoint {
         didSet {
+            syncYDispFromContentOffset()
 #if canImport(MetalKit)
             if useMetalRenderer, metalView != nil {
                 requestMetalDisplay()
             }
 #endif
         }
+    }
+
+    open override func accessibilityScroll(_ direction: UIAccessibilityScrollDirection) -> Bool {
+        let pageHeight = max(bounds.height, cellDimension.height)
+        let maxOffsetY = max(0, contentSize.height - bounds.height)
+        let targetOffsetY: CGFloat
+
+        switch direction {
+        case .down, .right, .next:
+            targetOffsetY = min(maxOffsetY, contentOffset.y + pageHeight)
+        case .up, .left, .previous:
+            targetOffsetY = max(0, contentOffset.y - pageHeight)
+        default:
+            return super.accessibilityScroll(direction)
+        }
+
+        guard targetOffsetY != contentOffset.y else {
+            return false
+        }
+
+        setContentOffset(CGPoint(x: contentOffset.x, y: targetOffsetY), animated: false)
+        setNeedsDisplay(bounds)
+        // Based on WWDC 2019 presentation: argument is nil
+        UIAccessibility.post(notification: .pageScrolled, argument: nil)
+        return true
     }
 
     // iOS Keyboard input
@@ -1521,6 +1793,10 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
         text == "." || text == ". "
     }
 
+    private var isKoreanTextInput: Bool {
+        textInputMode?.primaryLanguage?.hasPrefix("ko") == true
+    }
+
     private func normalizedTextForPendingAutoPeriodDelete(_ text: String) -> String? {
         switch text {
         case ".":
@@ -1540,7 +1816,7 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
             return normalized
         }
         guard isAutoPeriodReplacement(text) else { return nil }
-        guard rangeToReplace.endPosition.offset == textInputStorage.count else { return nil }
+        guard rangeToReplace.endPosition.offset == textInputStorage.textInputUTF16Count else { return nil }
         guard oldText.count <= 2 else { return nil }
         guard oldText.allSatisfy({ $0 == " " }) else { return nil }
         if text == "." {
@@ -1566,7 +1842,7 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
         pendingAutoPeriodDeleteWasSpace = false
         guard text == ". " else { return nil }
         guard rangeToReplace.isEmpty else { return nil }
-        guard rangeToReplace.endPosition.offset == textInputStorage.count else { return nil }
+        guard rangeToReplace.endPosition.offset == textInputStorage.textInputUTF16Count else { return nil }
         guard textInputStorage.last == " " else { return nil }
         uitiLog("auto-period insertion range text:\(text.debugDescription) -> \" \"")
         return " "
@@ -1578,8 +1854,15 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
             pendingAutoPeriodDeleteWasSpace = false
         }
 
-        if tryComposeKoreanFinal(text) {
+        switch processPendingKoreanResyllabification(text) {
+        case .completed:
             return
+        case .prefixReinserted:
+            break
+        case .none:
+            if tryResyllabifyKoreanFinalBeforeVowel(text) || tryComposeKoreanFinal(text) {
+                return
+            }
         }
 
         beginTextInputEdit()
@@ -1596,7 +1879,10 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
         let rangeStartIndex = rangeToReplace.startPosition.offset
         textInputStorage.replaceSubrange(rangeToReplace.fullRange(in: textInputStorage), with: textToInsert)
         _markedTextRange = nil
-        let insertedPosition = TextPosition(offset: rangeStartIndex + textToInsert.count)
+        let insertedOffset = textInputStorage.textInputValidUTF16Offset(
+            rangeStartIndex + textToInsert.textInputUTF16Count,
+            rounding: .forward)
+        let insertedPosition = TextPosition(offset: insertedOffset)
         _selectedTextRange = TextRange(from: insertedPosition, to: insertedPosition)
 
         endTextInputEdit()
@@ -2022,20 +2308,20 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
     // the sequence  "ㅇ", "ㅜ", "ㅇ" from becoming "웅", and instead
     // it becomes "우" followed by "ㅇ"
     private func tryComposeKoreanFinal(_ text: String) -> Bool {
-        guard let language = textInputMode?.primaryLanguage, language.hasPrefix("ko") else { return false }
+        guard isKoreanTextInput else { return false }
         guard _markedTextRange == nil else { return false }
-        guard _selectedTextRange.isEmpty, _selectedTextRange.endPosition.offset == textInputStorage.count else { return false }
+        guard _selectedTextRange.isEmpty, _selectedTextRange.endPosition.offset == textInputStorage.textInputUTF16Count else { return false }
         guard text.count == 1, let jamo = text.first else { return false }
-        guard let finalIndex = koreanFinalIndex[jamo] else { return false }
+        guard let finalIndex = HangulInput.finalIndexByJamo[jamo] else { return false }
         guard let lastChar = textInputStorage.last else { return false }
-        guard let composed = composeHangulSyllable(base: lastChar, finalIndex: finalIndex) else { return false }
+        guard let composed = HangulInput.composeSyllable(base: lastChar, finalIndex: finalIndex) else { return false }
 
         uitiLog("koreanComposeFinal base:\(lastChar) jamo:\(jamo) -> \(composed)")
 
         beginTextInputEdit()
         textInputStorage.removeLast()
         textInputStorage.append(composed)
-        let newOffset = textInputStorage.count
+        let newOffset = textInputStorage.textInputUTF16Count
         _markedTextRange = nil
         _selectedTextRange = TextRange(from: TextPosition(offset: newOffset), to: TextPosition(offset: newOffset))
         endTextInputEdit()
@@ -2046,49 +2332,113 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
         return true
     }
 
-    private let koreanFinalIndex: [Character: Int] = [
-        "ㄱ": 1, "ㄲ": 2, "ㄳ": 3,
-        "ㄴ": 4, "ㄵ": 5, "ㄶ": 6,
-        "ㄷ": 7,
-        "ㄹ": 8, "ㄺ": 9, "ㄻ": 10, "ㄼ": 11, "ㄽ": 12, "ㄾ": 13, "ㄿ": 14, "ㅀ": 15,
-        "ㅁ": 16,
-        "ㅂ": 17, "ㅄ": 18,
-        "ㅅ": 19, "ㅆ": 20,
-        "ㅇ": 21,
-        "ㅈ": 22,
-        "ㅊ": 23,
-        "ㅋ": 24,
-        "ㅌ": 25,
-        "ㅍ": 26,
-        "ㅎ": 27
-    ]
+    /// Completes the delete -> prefix reinsert -> composed syllable sequence
+    /// emitted by the Korean iOS keyboard when it moves a final consonant to
+    /// the next syllable. When there was a character before the base syllable,
+    /// replace UIKit's reinserted prefix with the complete corrected text. At
+    /// the start of the input buffer, append the corrected text directly.
+    private func processPendingKoreanResyllabification(_ text: String) -> PendingKoreanResyllabificationResult {
+        guard isKoreanTextInput,
+              _markedTextRange == nil,
+              _selectedTextRange.isEmpty,
+              _selectedTextRange.endPosition.offset == textInputStorage.textInputUTF16Count else {
+            resetKoreanResyllabificationTransaction()
+            return .none
+        }
 
-    private func composeHangulSyllable(base: Character, finalIndex: Int) -> Character? {
-        guard finalIndex > 0 && finalIndex < 28 else { return nil }
-        guard let scalar = base.unicodeScalars.first, base.unicodeScalars.count == 1 else { return nil }
-        let scalarValue = Int(scalar.value)
-        let sBase = 0xAC00
-        let sEnd = 0xD7A3
-        guard scalarValue >= sBase && scalarValue <= sEnd else { return nil }
-        let vCount = 21
-        let tCount = 28
-        let sIndex = scalarValue - sBase
-        let lIndex = sIndex / (vCount * tCount)
-        let vIndex = (sIndex % (vCount * tCount)) / tCount
-        let tIndex = sIndex % tCount
-        guard tIndex == 0 else { return nil }
-        let newScalarValue = sBase + (lIndex * vCount + vIndex) * tCount + finalIndex
-        guard let newScalar = UnicodeScalar(newScalarValue) else { return nil }
-        return Character(newScalar)
+        switch koreanResyllabificationTransaction.consumeInsertion(text) {
+        case .noMatch:
+            return .none
+        case .prefixReinserted:
+            return .prefixReinserted
+        case let .replacement(edit):
+            guard edit.charactersToDelete <= textInputStorage.count else {
+                return .none
+            }
+            if edit.charactersToDelete > 0 {
+                let textToReplace = String(textInputStorage.suffix(edit.charactersToDelete))
+                guard edit.textToInsert.hasPrefix(textToReplace) else { return .none }
+            }
+
+            uitiLog("koreanResyllabifyTransaction delete:\(edit.charactersToDelete) insert:\(edit.textToInsert.debugDescription)")
+
+            beginTextInputEdit()
+            for _ in 0..<edit.charactersToDelete {
+                textInputStorage.removeLast()
+            }
+            textInputStorage.append(contentsOf: edit.textToInsert)
+            let newOffset = textInputStorage.textInputUTF16Count
+            _markedTextRange = nil
+            _selectedTextRange = TextRange(from: TextPosition(offset: newOffset), to: TextPosition(offset: newOffset))
+            endTextInputEdit()
+
+            for _ in 0..<edit.charactersToDelete {
+                sendBackspaceKey()
+            }
+            send(txt: edit.textToInsert)
+            queuePendingDisplay()
+            return .completed
+        }
+    }
+
+    // If a vowel follows a syllable with a final consonant, Korean IMEs can
+    // reinterpret that final consonant as the initial consonant of the next
+    // syllable. For example, "핫" + "ㅔ" must replace "핫" with "하세",
+    // preserving the previous syllable instead of sending only "세".
+    private func tryResyllabifyKoreanFinalBeforeVowel(_ text: String) -> Bool {
+        guard isKoreanTextInput else { return false }
+        guard _markedTextRange == nil else { return false }
+        guard _selectedTextRange.isEmpty, _selectedTextRange.endPosition.offset == textInputStorage.textInputUTF16Count else { return false }
+        guard text.count == 1, let vowel = text.first else { return false }
+        guard HangulInput.vowelIndexByJamo[vowel] != nil else { return false }
+        guard let lastChar = textInputStorage.last else { return false }
+        guard let edit = HangulInput.resyllabificationEdit(base: lastChar, followingVowel: vowel) else { return false }
+
+        uitiLog("koreanResyllabifyFinal base:\(lastChar) vowel:\(vowel) delete:\(edit.charactersToDelete) insert:\(edit.textToInsert.debugDescription)")
+
+        beginTextInputEdit()
+        for _ in 0..<edit.charactersToDelete {
+            textInputStorage.removeLast()
+        }
+        textInputStorage.append(contentsOf: edit.textToInsert)
+        let newOffset = textInputStorage.textInputUTF16Count
+        _markedTextRange = nil
+        _selectedTextRange = TextRange(from: TextPosition(offset: newOffset), to: TextPosition(offset: newOffset))
+        endTextInputEdit()
+
+        for _ in 0..<edit.charactersToDelete {
+            sendBackspaceKey()
+        }
+        send(txt: edit.textToInsert)
+        queuePendingDisplay()
+        return true
+    }
+
+    private func trackKoreanResyllabificationDeletion(_ deletedText: Substring, range: TextRange) {
+        guard isKoreanTextInput,
+              _markedTextRange == nil,
+              range.endPosition.offset == textInputStorage.textInputUTF16Count else {
+            resetKoreanResyllabificationTransaction()
+            return
+        }
+
+        koreanResyllabificationTransaction.begin(deletedText: String(deletedText))
     }
 
     func ensureCaretIsVisible ()
     {
+        guard !terminal.synchronizedOutputActive else { return }
         let displayBuffer = terminal.displayBuffer
-        contentOffset = CGPoint (x: 0, y: CGFloat (displayBuffer.lines.count-displayBuffer.rows)*cellDimension.height)
+        let realCaret = displayBuffer.y + displayBuffer.yBase
+        let viewportEnd = displayBuffer.yDisp + displayBuffer.rows
+
+        if userScrolling || terminal.userScrolling || realCaret >= viewportEnd || realCaret < displayBuffer.yDisp {
+            resetManualScrollTracking()
+            updateScroller()
+        }
     }
     
-    public func deleteBackward() {
+    open func deleteBackward() {
         uitiLog("deleteBackward() \(textInputStateDescription())")
 
         // after backward deletion, marked range is always cleared, and length of selected range is always zero
@@ -2096,6 +2446,7 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
         var rangeStartPosition = rangeToDelete.startPosition
         var rangeStartIndex = rangeStartPosition.offset
         if rangeToDelete.isEmpty {
+            resetKoreanResyllabificationTransaction()
             // If there is no selected text, delete the character before the cursor
 
             if rangeStartIndex == 0 {
@@ -2110,12 +2461,18 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
 
             beginTextInputEdit()
 
-            rangeStartIndex -= 1
-            let deleteIndex = textInputStorage.index(textInputStorage.startIndex, offsetBy: rangeStartIndex)
-            let deletedChar = textInputStorage[deleteIndex]
-            let deletingAtEnd = rangeStartPosition.offset == textInputStorage.count
+            guard let deleteRange = textInputStorage.textInputCharacterRange(beforeUTF16Offset: rangeStartIndex) else {
+                pendingAutoPeriodDeleteWasSpace = false
+                self.sendBackspaceKey()
+                uitiLog("deleteBackward() no text to delete, sending backspace")
+                endTextInputEdit()
+                return
+            }
+            rangeStartIndex = textInputStorage.textInputUTF16Offset(of: deleteRange.lowerBound)
+            let deletedChar = textInputStorage[deleteRange]
+            let deletingAtEnd = rangeStartPosition.offset == textInputStorage.textInputUTF16Count
             pendingAutoPeriodDeleteWasSpace = deletingAtEnd && deletedChar == " " && _markedTextRange == nil
-            textInputStorage.remove(at: deleteIndex)
+            textInputStorage.removeSubrange(deleteRange)
             rangeStartPosition = TextPosition(offset: rangeStartIndex)
 
             self.sendBackspaceKey()
@@ -2125,6 +2482,7 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
             // Send as many backspaces that are in the range to delete. When on auto-repeat, after a some time
             // pressing the backspace, it will delete chunks of text at a time.
             let oldText = textInputStorage[rangeToDelete.fullRange(in: textInputStorage)]
+            trackKoreanResyllabificationDeletion(oldText, range: rangeToDelete)
             let backspaces = oldText.count
             for _ in 0..<backspaces {
                 self.sendBackspaceKey()
@@ -2192,7 +2550,7 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
     /// property in case someone needs the return key to send different sequences.
     public var returnByteSequence: [UInt8] = [13]
     
-    public override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+    open override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
         var didHandleEvent = false
         let wasCommandActive = commandActive
         let kittyFlags = terminal.keyboardEnhancementFlags
@@ -2646,6 +3004,10 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
     public func clipboardCopy(source: Terminal, content: Data) {
         terminalDelegate?.clipboardCopy(source: self, content: content)
     }
+    
+    public func clipboardRead(source: Terminal) -> Data? {
+        return terminalDelegate?.clipboardRead(source: self)
+    }
 
     public func iTermContent (source: Terminal, content: ArraySlice<UInt8>) {
         terminalDelegate?.iTermContent(source: self, content: content)
@@ -2665,7 +3027,234 @@ extension TerminalViewDelegate {
     
     public func iTermContent (source: TerminalView, content: ArraySlice<UInt8>) {
     }
+    
+    public func clipboardCopy(source: TerminalView, content: Data) {
+    }
+    
+    public func clipboardRead(source: TerminalView) -> Data? {
+        return nil
+    }
 }
+
+extension TerminalView: UIAccessibilityReadingContent {
+    private func accessibilityBaseAttributes() -> [NSAttributedString.Key: Any] {
+        getAttributes(CharData.defaultAttr, withUrl: false) ?? [.font: fontSet.normal]
+    }
+
+    private func accessibilityAttributedLine(_ row: Int, endCol: Int = -1) -> NSAttributedString {
+        guard row >= 0, row < terminal.displayBuffer.lines.count else {
+            return NSAttributedString(string: "")
+        }
+
+        let line = terminal.displayBuffer.lines[row]
+        let rawLimit = endCol == -1 ? line.count : min(endCol, line.count)
+        let lineLimit = min(rawLimit, line.getTrimmedLength())
+        guard line.hasAnyContent(), lineLimit > 0 else {
+            return NSAttributedString(string: "")
+        }
+
+        let lineInfo = buildAttributedString(row: row, line: line, cols: lineLimit)
+        let result = NSMutableAttributedString()
+        for segment in lineInfo.segments {
+            result.append(segment.attributedString)
+        }
+        return result
+    }
+
+    private func accessibilityAttributedDisplayText(start: Position, end: Position) -> NSAttributedString {
+        let buffer = terminal.displayBuffer
+        guard !buffer.lines.isEmpty else {
+            return NSAttributedString(string: "")
+        }
+
+        var start = start
+        var end = end
+
+        switch Position.compare(start, end) {
+        case .equal:
+            return NSAttributedString(string: "")
+        case .after:
+            swap(&start, &end)
+        case .before:
+            break
+        }
+
+        guard start.row >= 0, start.row <= buffer.lines.count else {
+            return NSAttributedString(string: "")
+        }
+
+        if end.row >= buffer.lines.count {
+            end.row = buffer.lines.count - 1
+        }
+
+        let newline = NSAttributedString(string: "\n", attributes: accessibilityBaseAttributes())
+        var lines: [NSMutableAttributedString] = [NSMutableAttributedString()]
+        var currentLine = lines[0]
+        var blanks: [NSMutableAttributedString] = []
+
+        func addBlanks() {
+            guard !blanks.isEmpty else {
+                return
+            }
+            for blank in blanks {
+                lines.append(blank)
+            }
+            currentLine = blanks.last!
+            blanks.removeAll()
+        }
+
+        var bufferLine = buffer.lines[start.row]
+        if bufferLine.hasAnyContent() {
+            currentLine.append(accessibilityAttributedLine(start.row, endCol: start.row < end.row ? -1 : end.col))
+        }
+
+        var line = start.row + 1
+        var isWrapped = false
+        while line < end.row {
+            bufferLine = buffer.lines[line]
+            isWrapped = bufferLine.isWrapped
+
+            if bufferLine.hasAnyContent() {
+                addBlanks()
+
+                if !isWrapped {
+                    currentLine = NSMutableAttributedString()
+                    lines.append(currentLine)
+                }
+
+                currentLine.append(accessibilityAttributedLine(line))
+            } else {
+                if !isWrapped || blanks.isEmpty {
+                    blanks.append(NSMutableAttributedString())
+                }
+            }
+
+            line += 1
+        }
+
+        if end.row != start.row {
+            bufferLine = buffer.lines[end.row]
+            if bufferLine.hasAnyContent() {
+                addBlanks()
+
+                isWrapped = bufferLine.isWrapped
+                if !isWrapped {
+                    currentLine = NSMutableAttributedString()
+                    lines.append(currentLine)
+                }
+
+                currentLine.append(accessibilityAttributedLine(end.row, endCol: end.col))
+            }
+        }
+
+        let result = NSMutableAttributedString()
+        for (index, attributedLine) in lines.enumerated() {
+            if index > 0 {
+                result.append(newline)
+            }
+            result.append(attributedLine)
+        }
+        return result
+    }
+
+    public func accessibilityLineNumber(for point: CGPoint) -> Int {
+        return Int(floor(max(point.y,0) / cellDimension.height))
+    }
+    
+    func startingLine(forLineNumber lineNumber: Int) -> Int {
+        let lineWidth = terminal.buffer.lines[lineNumber].count
+        var startingLine = lineNumber
+        while startingLine >= 1 {
+            startingLine -= 1
+            if terminal.buffer.lines[startingLine + 1].isWrapped {
+                continue
+            }
+            let start = Position(col: 0, row: startingLine)
+            let end = Position(col: terminal.buffer.lines[startingLine].count, row: startingLine)
+            let text =  terminal.getDisplayText(start: start, end: end)
+            if (text.count != terminal.buffer.lines[startingLine].count || text.last != " ") {
+                // previous line is incomplete. Don't use it
+                startingLine += 1
+                break
+            }
+        }
+        return startingLine
+    }
+
+    func endingLine(forLineNumber lineNumber: Int) -> Int {
+        let lineWidth = terminal.buffer.lines[lineNumber].count
+        var endingLine = lineNumber
+        while (endingLine < terminal.buffer.lines.count - 1) {
+            let start = Position(col: 0, row: endingLine)
+            let end = Position(col: terminal.buffer.lines[endingLine].count, row: endingLine)
+            let text =  terminal.getDisplayText(start: start, end: end)
+            if (text.count != terminal.buffer.lines[endingLine].count || text.last != " ")
+            && !terminal.buffer.lines[endingLine + 1].isWrapped {
+                // this line is incomplete. We stop here.
+                break
+            }
+            endingLine += 1
+        }
+        return endingLine
+    }
+
+    public func accessibilityContent(forLineNumber lineNumber: Int) -> String? {
+        var startingLine = startingLine(forLineNumber: lineNumber)
+        var endingLine = endingLine(forLineNumber: lineNumber)
+        let start = Position(col: 0, row: startingLine)
+        let end = Position(col: terminal.buffer.lines[endingLine].count,
+                           row: endingLine)
+        var text =  terminal.getDisplayText(start: start, end: end)
+        return terminal.getDisplayText(start: start, end: end)
+    }
+
+    public func accessibilityFrame(forLineNumber lineNumber: Int) -> CGRect {
+        let topVisibleLine = Int(contentOffset.y/cellDimension.height)
+        let offset = contentOffset.y - CGFloat(topVisibleLine) * cellDimension.height
+        var startingLine = startingLine(forLineNumber: lineNumber)
+        var endingLine = endingLine(forLineNumber: lineNumber)
+        var verticalWidth = CGFloat(endingLine - startingLine + 1)
+        let lineOffset =  cellDimension.height * CGFloat (startingLine - topVisibleLine + 1)
+        let lineOrigin = CGPoint(x: 0, y: lineOffset)
+        let columnCount = terminal.buffer.lines[lineNumber].count
+        var rect = CGRect(
+            x: lineOrigin.x,
+            y: lineOrigin.y + 3 - offset,
+            width: CGFloat(columnCount) * cellDimension.width,
+            height: verticalWidth * cellDimension.height)
+        return rect
+    }
+
+    public func accessibilityPageContent() -> String? {
+        let pageHeight = max(bounds.height, cellDimension.height)
+        let lines = Int(floor(pageHeight/cellDimension.height))
+        let startLine = Int(floor(contentOffset.y / cellDimension.height))
+        let start = Position(col: 0, row: startLine)
+        let end = Position(col: terminal.buffer.lines[startLine].count,
+                           row: startLine + lines)
+        return terminal.getDisplayText(start: start, end: end)
+    }
+
+    public func accessibilityAttributedContent(forLineNumber lineNumber: Int) -> NSAttributedString? {
+        var startingLine = startingLine(forLineNumber: lineNumber)
+        var endingLine = endingLine(forLineNumber: lineNumber)
+        var start = Position(col: 0, row: startingLine)
+        var end = Position(col: terminal.buffer.lines[endingLine].count,
+                           row: endingLine)
+        return accessibilityAttributedDisplayText(start: start, end: end)
+    }
+
+    public func accessibilityAttributedPageContent() -> NSAttributedString? {
+        let pageHeight = max(bounds.height, cellDimension.height)
+        let lines = Int(floor(pageHeight/cellDimension.height))
+        let startLine = Int(floor(contentOffset.y / cellDimension.height))
+        let start = Position(col: 0, row: startLine)
+        let end = Position(col: terminal.buffer.lines[startLine].count,
+                           row: startLine + lines)
+        return accessibilityAttributedDisplayText(start: start, end: end)
+    }
+}
+
 
 #if canImport(UIKit) && DEBUG
 #Preview {
