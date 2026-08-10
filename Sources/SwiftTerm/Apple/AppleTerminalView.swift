@@ -1830,16 +1830,38 @@ extension TerminalView {
 
         terminal.clearUpdateRange ()
 
+        // Damaged rows are recorded against yBase, but painted against yDisp.
+        //
+        // `Terminal.updateRange` is fed buffer.y / scrollTop / scrollBottom, all of which are
+        // rows of the screen anchored at `yBase`. Everything below treats them as screen rows
+        // of the *viewport*, which is anchored at `yDisp`. The two only coincide when the view
+        // is showing the live bottom. While the user is scrolled up by `scrollDelta` rows, a
+        // row dirtied at `y` is actually drawn at screen row `y + scrollDelta`, so the row that
+        // really changed was never invalidated and kept its stale pixels: a TUI rewriting its
+        // input box in place (no linefeed, so no full-screen repaint to heal it) left torn or
+        // duplicated lines on screen, and locally echoed keystrokes never appeared even though
+        // the caret — a separate view, positioned correctly — advanced over them.
+        //
+        // Extend the band rather than translating it: `updateFullScreen()` and
+        // `refresh(startRow:endRow:)` are called by the *view* in viewport coordinates, so both
+        // readings have to stay covered. Extending down by `scrollDelta` is exactly the union
+        // of the two, and is a no-op in the common case where the viewport is at the bottom.
         #if os(macOS)
+        let damageBuffer = terminal.displayBuffer
+        let scrollDelta = max (0, damageBuffer.yBase - damageBuffer.yDisp)
+        // max(rowEnd, ...) keeps this strictly an extension — the clamp must never be able to
+        // shrink the band below what was already dirty, which would invert the region height.
+        let paintEnd = scrollDelta > 0 ? max (rowEnd, min (terminal.rows - 1, rowEnd + scrollDelta)) : rowEnd
+
         let baseLine = frame.height
         var region = CGRect (x: 0,
-                             y: baseLine - (cellDimension.height + CGFloat(rowEnd) * cellDimension.height),
+                             y: baseLine - (cellDimension.height + CGFloat(paintEnd) * cellDimension.height),
                              width: frame.width,
-                             height: CGFloat(rowEnd-rowStart + 1) * cellDimension.height)
-        
+                             height: CGFloat(paintEnd-rowStart + 1) * cellDimension.height)
+
         // If we are the last line, we should also queue a refresh for the "remaining" bits at the
         // end which can be redrawn by large unicode
-        if rowEnd == terminal.rows - 1 {
+        if paintEnd == terminal.rows - 1 {
             let oh = region.height
             let oy = region.origin.y
             region = CGRect (x: 0, y: 0, width: frame.width, height: oh + oy)
@@ -1861,9 +1883,9 @@ extension TerminalView {
                 let maxRow = buffer.lines.count - 1
                 let visibleStart = buffer.yDisp
                 let visibleEnd = min(maxRow, buffer.yDisp + buffer.rows - 1)
-                if rowStart >= 0 && rowEnd >= rowStart && rowEnd < terminal.rows {
+                if rowStart >= 0 && paintEnd >= rowStart && paintEnd < terminal.rows {
                     let absStart = buffer.yDisp + rowStart
-                    let absEnd = buffer.yDisp + rowEnd
+                    let absEnd = buffer.yDisp + paintEnd
                     let clampedStart = max(0, min(absStart, maxRow))
                     let clampedEnd = max(0, min(absEnd, maxRow))
                     if clampedStart <= clampedEnd {
