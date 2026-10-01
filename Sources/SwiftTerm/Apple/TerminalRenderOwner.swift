@@ -315,6 +315,47 @@ final class TerminalRenderOwner: Sendable {
         }
     }
 
+    func bufferSnapshot(rows selection: TerminalBufferRows) -> TerminalBufferSnapshot {
+        guard let terminal = currentSession()?.terminal else {
+            return TerminalBufferSnapshot(
+                lines: [], firstRow: 0, lineCount: 0, yBase: 0, yDisp: 0,
+                totalLinesTrimmed: 0,
+                dimensions: TerminalDimensions(cols: 0, rows: 0),
+                cursor: Position(col: 0, row: 0),
+                isAlternateBuffer: false,
+                hasImages: false,
+                scrollback: 0)
+        }
+        return terminal.terminalLock.withLock {
+            let buffer = terminal.displayBuffer
+            let count = buffer.lines.count
+            let wanted: Range<Int>
+            switch selection {
+            case .none:
+                wanted = 0..<0
+            case .screen:
+                wanted = buffer.yBase..<(buffer.yBase + terminal.rows)
+            case .viewport:
+                wanted = buffer.yDisp..<(buffer.yDisp + terminal.rows)
+            case .tail(let n):
+                wanted = max(0, count - max(0, n))..<count
+            }
+            let range = wanted.clamped(to: 0..<count)
+            return TerminalBufferSnapshot(
+                lines: range.map { BufferLine(from: buffer.lines[$0]) },
+                firstRow: range.lowerBound,
+                lineCount: count,
+                yBase: buffer.yBase,
+                yDisp: buffer.yDisp,
+                totalLinesTrimmed: buffer.totalLinesTrimmed,
+                dimensions: TerminalDimensions(cols: terminal.cols, rows: terminal.rows),
+                cursor: Position(col: buffer.x, row: buffer.y),
+                isAlternateBuffer: terminal.isDisplayBufferAlternate,
+                hasImages: buffer.hasAnyImages,
+                scrollback: terminal.options.scrollback)
+        }
+    }
+
     func setCursorStyle(_ style: CursorStyle) {
         guard let terminal = currentSession()?.terminal else { return }
         terminal.terminalLock.withLock {

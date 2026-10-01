@@ -1053,6 +1053,51 @@ public struct TerminalViewStateSnapshot: Sendable {
     public let visibleRows: [TerminalVisibleRowSnapshot]
 }
 
+/// The buffer lines a ``TerminalBufferSnapshot`` copies.
+public enum TerminalBufferRows: Sendable, Equatable {
+    /// No lines: only the scroll anchors, dimensions and cursor.
+    case none
+    /// The live screen: the `rows` lines starting at `yBase`.
+    case screen
+    /// What the viewport shows: the `rows` lines starting at `yDisp`.
+    case viewport
+    /// The newest `count` lines of the buffer, scrollback and screen.
+    case tail(Int)
+}
+
+/// Copied lines of the displayed buffer, with their cells and attributes.
+///
+/// The lines are deep copies taken under the terminal lock, so they stay valid and unchanged
+/// while the terminal keeps parsing. Rows are buffer rows: `0` is the oldest line the buffer
+/// still holds.
+public struct TerminalBufferSnapshot {
+    /// The copied lines, oldest first. `lines[i]` is buffer row `firstRow + i`.
+    public let lines: [BufferLine]
+    /// The buffer row of `lines[0]`.
+    public let firstRow: Int
+    /// The number of lines the buffer holds, scrollback and screen.
+    public let lineCount: Int
+    /// The buffer row at the top of the live screen.
+    public let yBase: Int
+    /// The buffer row at the top of the viewport. Below `yBase` while scrolled back.
+    public let yDisp: Int
+    /// Lines trimmed from the top of the scrollback so far. Adding it to a buffer row gives
+    /// the row's scroll-invariant index.
+    public let totalLinesTrimmed: Int
+    public let dimensions: TerminalDimensions
+    /// The cursor, relative to the live screen.
+    public let cursor: Position
+    /// Whether the alternate screen buffer is displayed.
+    public let isAlternateBuffer: Bool
+    /// Whether any line of the buffer holds an inline image.
+    public let hasImages: Bool
+    /// The scrollback limit the buffer trims to, in lines.
+    public let scrollback: Int
+
+    /// Whether the viewport shows the live screen.
+    public var isAtBottom: Bool { yDisp >= yBase }
+}
+
 /// Delivers input to one main-actor sink in FIFO order.
 ///
 /// At most one drain task is pending. The queue preserves the order in which
@@ -1642,6 +1687,13 @@ extension TerminalView {
     /// Returns copied terminal state for status displays and diagnostics.
     public nonisolated func terminalStateSnapshot() -> TerminalViewStateSnapshot {
         renderOwner.stateSnapshot()
+    }
+
+    /// Copies lines of the displayed buffer, with cells and attributes, together with the
+    /// scroll anchors they are positioned against. Use ``terminalStateSnapshot()`` when text
+    /// is enough.
+    public nonisolated func bufferSnapshot(rows: TerminalBufferRows = .none) -> TerminalBufferSnapshot {
+        renderOwner.bufferSnapshot(rows: rows)
     }
 
     /// Copies terminal buffer contents without exposing the mutable terminal.
@@ -4286,12 +4338,16 @@ extension TerminalView {
         }
     }
 
-    private func updateUserScrollingStateLocked(for row: Int, in displayBuffer: Buffer) {
+    func updateUserScrollingStateLocked(for row: Int, in displayBuffer: Buffer) {
         terminal.terminalLock.preconditionLocked()
         let maxScrollback = max(0, displayBuffer.lines.count - displayBuffer.rows)
         let isUserScrolling = row < maxScrollback
         userScrolling = isUserScrolling
+#if os(macOS)
+        terminal.userScrolling = isUserScrolling || holdsPosition
+#else
         terminal.userScrolling = isUserScrolling
+#endif
     }
     
     public func scrollTo (row: Int, notifyAccessibility: Bool = true)

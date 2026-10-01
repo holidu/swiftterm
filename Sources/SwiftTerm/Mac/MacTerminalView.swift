@@ -1665,6 +1665,18 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
     
     var userScrolling = false
 
+    /// Keeps the viewport where it is when new output arrives, even while it shows the live
+    /// screen. Scrolling still moves it. Clear it to follow the output again from the bottom.
+    public var holdsPosition = false {
+        didSet {
+            guard holdsPosition != oldValue else { return }
+            withTerminal { terminal in
+                let displayBuffer = terminal.displayBuffer
+                updateUserScrollingStateLocked(for: displayBuffer.yDisp, in: displayBuffer)
+            }
+        }
+    }
+
     override open func viewWillDraw() {
         
         // Starting with BigSur, it looks like even sending one pixel to be redrawn will trigger

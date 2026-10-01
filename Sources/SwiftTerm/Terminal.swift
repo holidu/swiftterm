@@ -419,10 +419,6 @@ open class Terminal {
     private(set) var _rows: Int = 25
     var tabStopWidth : Int = 8
     
-    /// Optional label set by the host app to identify this terminal instance
-    /// (e.g. session ID, window name) in its own logs and diagnostics.
-    public var debugLabel: String?
-
     /// Terminal configuration options.
     /// Setup(isReset:) method should be called to apply changes
     public var options: TerminalOptions {
@@ -786,11 +782,7 @@ open class Terminal {
     var refreshEnd = -1
     var scrollInvariantRefreshStart = Int.max
     var scrollInvariantRefreshEnd = -1
-    public var userScrolling = false
-    /// Timestamp (`CFAbsoluteTime` / `Date.timeIntervalSinceReferenceDate`) of the last
-    /// data fed from the host, updated on every parse. App code can poll this to detect
-    /// when output stops.
-    public var lastFeedTimestamp: Double = 0
+    var userScrolling = false
     var lineFeedMode = false
     
     // We do not implement smooth scrolling here, dubious value, but
@@ -7384,9 +7376,6 @@ open class Terminal {
      */
     public func parse (buffer: ArraySlice<UInt8>)
     {
-#if !SWIFTTERM_EMBEDDED
-        lastFeedTimestamp = Date().timeIntervalSinceReferenceDate
-#endif
         parseDepth += 1
         defer {
             parseDepth -= 1
@@ -7401,9 +7390,6 @@ open class Terminal {
     /// Parses one borrowed batch and completes all parser effects before return.
     private func parseBorrowed(_ bytes: Span<UInt8>)
     {
-#if !SWIFTTERM_EMBEDDED
-        lastFeedTimestamp = Date().timeIntervalSinceReferenceDate
-#endif
         parseDepth += 1
         defer {
             parseDepth -= 1
