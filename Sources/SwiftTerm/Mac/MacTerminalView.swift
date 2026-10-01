@@ -1540,6 +1540,12 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
     /// terminal if it has requested the data.   This poses a problem for selection, so users
     /// need a way of toggling this behavior.
     public var allowMouseReporting: Bool = true
+    /// Max SGR mouse scroll reports sent per scroll event, settable by the host app.
+    /// Kept out of upstream deliberately: applications like Claude Code multiply EACH
+    /// report by their own speed factor (CLAUDE_CODE_SCROLL_SPEED), so sending one report
+    /// per accumulated line makes fast trackpad flicks jump (N lines x speed factor).
+    /// Applied on top of `WheelReportBudget`; the default leaves its burst unchanged.
+    public var mouseScrollReportCap: Int = WheelReportBudget.burst
 
     /// Controls how link tracking resolves hovered links:
     /// `.explicit` = OSC 8 only, `.implicit` = explicit + implicit fallback, `.none` = off.
@@ -4002,7 +4008,7 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
         }
         updateHoverLink(at: hit.grid)
         
-        if withTerminal({ $0.mouseMode.sendMotionEvent() }) {
+        if allowMouseReporting && withTerminal({ $0.mouseMode.sendMotionEvent() }) {
             let flags = encodeMouseEvent(with: event, overwriteRelease: true)
             withTerminal { terminal in
                 let displayBuffer = terminal.displayBuffer
@@ -4198,9 +4204,14 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
                 let screenRow = max(0, min(displayBuffer.rows - 1, hit.grid.row - displayBuffer.yDisp))
                 let buttonFlags = terminal.encodeButton(button: button, release: false,
                                                         shift: flags.contains(.shift), meta: flags.contains(.option), control: flags.contains(.control))
-                let wantedReports = WheelReportBudget.requestedReports(
-                    lineCount: lines,
-                    isPrecise: event.hasPreciseScrollingDeltas)
+                // Capped (holidu): the receiving app scales each report by its own speed
+                // setting, so reports-per-event must stay bounded regardless of how many
+                // lines the accumulator produced for this event.
+                let wantedReports = min(
+                    WheelReportBudget.requestedReports(
+                        lineCount: lines,
+                        isPrecise: event.hasPreciseScrollingDeltas),
+                    max(1, mouseScrollReportCap))
                 let reports = wheelReportBudget.grant(wantedReports)
                 for _ in 0..<reports {
                     terminal.sendEvent(buttonFlags: buttonFlags, x: hit.grid.col, y: screenRow,

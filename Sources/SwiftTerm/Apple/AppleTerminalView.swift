@@ -4431,7 +4431,7 @@ extension TerminalView {
                 rows: rows,
                 cellWidth: cellPixels.width,
                 cellHeight: cellPixels.height)
-            terminal.softReset()
+            terminal.resizeCleanup()
         }
         terminalDelegate?.sizeChanged(source: self, newCols: cols, newRows: rows)
         updateScroller()
