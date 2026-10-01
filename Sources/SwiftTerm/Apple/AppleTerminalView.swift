@@ -1684,6 +1684,13 @@ extension TerminalView {
         renderOwner.keyboardEnhancementFlags()
     }
 
+    /// Whether the running application has enabled bracketed paste (DECSET 2004), as a copied
+    /// value. The same flag ``terminalStateSnapshot()`` carries, without copying the visible
+    /// text, for a host that wraps pasted input itself.
+    public nonisolated var bracketedPasteMode: Bool {
+        renderOwner.bracketedPasteMode()
+    }
+
     /// Returns copied terminal state for status displays and diagnostics.
     public nonisolated func terminalStateSnapshot() -> TerminalViewStateSnapshot {
         renderOwner.stateSnapshot()

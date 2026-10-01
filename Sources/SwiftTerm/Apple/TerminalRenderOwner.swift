@@ -298,6 +298,15 @@ final class TerminalRenderOwner: Sendable {
         }
     }
 
+    func bracketedPasteMode() -> Bool {
+        guard let terminal = currentSession()?.terminal else {
+            return false
+        }
+        return terminal.terminalLock.withLock {
+            terminal.bracketedPasteMode
+        }
+    }
+
     func keyboardEnhancementFlags() -> KittyKeyboardFlags {
         guard let terminal = currentSession()?.terminal else {
             return []
