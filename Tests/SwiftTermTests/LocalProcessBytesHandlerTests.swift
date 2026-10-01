@@ -63,6 +63,22 @@ private final class ByteSink: @unchecked Sendable {
         #expect(sink.text.isEmpty)
     }
 
+    /// The handler is read on every output batch, for the life of the session. Storing it in the
+    /// generic `Locked<Value>` and reading it with `withLock { $0 }` grew the closure by two
+    /// reabstraction thunks per read, and a live session overflowed the IO reader's stack after
+    /// about 75 minutes. Far more batches than that, on the real delivery path, must stay flat.
+    @Test @MainActor
+    func handlerSurvivesManyBatchesWithoutGrowing() {
+        let view = LocalProcessTerminalView(frame: CGRect(x: 0, y: 0, width: 640, height: 320))
+        let sink = ByteSink()
+        view.setProcessBytesHandler { sink.append($0) }
+        let batch: [UInt8] = Array("x".utf8)
+        for _ in 0..<300_000 {
+            view.processAdapter.dataReceived(slice: batch[...])
+        }
+        #expect(sink.text.utf8.count == 300_000)
+    }
+
     @Test @MainActor
     func bracketedPasteModeTracksDecset2004() async {
         let view = LocalProcessTerminalView(frame: CGRect(x: 0, y: 0, width: 640, height: 320))

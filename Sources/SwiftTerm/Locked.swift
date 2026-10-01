@@ -138,4 +138,36 @@ final class LockedVoidCallback: Sendable {
     }
 }
 
+/// Stores the replaceable process-bytes callback with its concrete function type.
+///
+/// **Never keep a closure in `Locked<Value>` and read it with `withLock { $0 }`.** That body is
+/// an `inout` access through a generic container, so the closure is reabstracted on the way out
+/// and again on the write-back, and the stored value grows by two thunks on every access. Read
+/// once per output batch, the chain reached the IO reader's stack limit after about 75 minutes
+/// of a live session and crashed it (EXC_BAD_ACCESS, hundreds of alternating
+/// `ArraySlice<UInt8>` thunks, 2026-10-01). This is the same reason `LockedVoidCallback` exists.
+final class LockedBytesCallback: @unchecked Sendable {
+    private let lock = NSLock()
+    private var callback: (@Sendable (ArraySlice<UInt8>) -> Void)?
+
+    func replace(with body: (@Sendable (ArraySlice<UInt8>) -> Void)?) {
+        lock.lock()
+        callback = body
+        lock.unlock()
+    }
+
+    var isInstalled: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return callback != nil
+    }
+
+    func call(_ bytes: ArraySlice<UInt8>) {
+        lock.lock()
+        let current = callback
+        lock.unlock()
+        current?(bytes)
+    }
+}
+
 #endif // !SWIFTTERM_EMBEDDED

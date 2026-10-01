@@ -131,14 +131,14 @@ public extension LocalProcessTerminalViewDelegate {
     }
 }
 
-private final class LocalProcessTerminalViewProcessAdapter:
+final class LocalProcessTerminalViewProcessAdapter:
     LocalProcessDelegate, LocalProcessBorrowedDataDelegate, Sendable
 {
     private let renderOwner: TerminalRenderOwner
     private let frameSignal: FrameDriverSignal
     private let diagnosticsState: Locked<TerminalView.Diagnostics>
     private let outputHandler: LockedVoidCallback
-    private let bytesHandler: Locked<(@Sendable (ArraySlice<UInt8>) -> Void)?>
+    private let bytesHandler: LockedBytesCallback
     private let windowSize = Locked(winsize())
     private let inputProcess = Locked(WeakLocalProcessInputReference())
     private let failureHandler: @MainActor @Sendable (LocalProcessError) -> Void
@@ -148,7 +148,7 @@ private final class LocalProcessTerminalViewProcessAdapter:
          frameSignal: FrameDriverSignal,
          diagnosticsState: Locked<TerminalView.Diagnostics>,
          outputHandler: LockedVoidCallback,
-         bytesHandler: Locked<(@Sendable (ArraySlice<UInt8>) -> Void)?>,
+         bytesHandler: LockedBytesCallback,
          failureHandler: @escaping @MainActor @Sendable (LocalProcessError) -> Void,
          terminationHandler: @escaping @MainActor @Sendable (Int32?) -> Void) {
         self.renderOwner = renderOwner
@@ -196,7 +196,7 @@ private final class LocalProcessTerminalViewProcessAdapter:
             diagnostics.batches += 1
         }
         outputHandler.call()
-        bytesHandler.withLock { $0 }?(slice)
+        bytesHandler.call(slice)
         frameSignal.markDirty()
     }
 
@@ -210,10 +210,10 @@ private final class LocalProcessTerminalViewProcessAdapter:
             diagnostics.batches += 1
         }
         outputHandler.call()
-        if let handler = bytesHandler.withLock({ $0 }) {
+        if bytesHandler.isInstalled {
             // Copy only when somebody asked for the bytes; the borrowed span ends with this call.
             let copy = bytes.withUnsafeBufferPointer { Array($0) }
-            handler(copy[...])
+            bytesHandler.call(copy[...])
         }
         frameSignal.markDirty()
     }
@@ -250,9 +250,10 @@ private final class LocalProcessTerminalViewProcessAdapter:
 open class LocalProcessTerminalView: TerminalView, TerminalViewDelegate {
     
     public internal(set) var process: LocalProcess!
-    private var processAdapter: LocalProcessTerminalViewProcessAdapter!
+    /// Internal so tests can drive the delivery path a real process uses.
+    private(set) var processAdapter: LocalProcessTerminalViewProcessAdapter!
     nonisolated private let processOutputHandler = LockedVoidCallback()
-    nonisolated private let processBytesHandler = Locked<(@Sendable (ArraySlice<UInt8>) -> Void)?>(nil)
+    nonisolated private let processBytesHandler = LockedBytesCallback()
 
     public override init (frame: CGRect)
     {
@@ -319,7 +320,7 @@ open class LocalProcessTerminalView: TerminalView, TerminalViewDelegate {
     /// that mirror or log the raw output stream. The handler must return quickly and must not
     /// touch AppKit; hop to the main queue for anything else. Batches arrive in order.
     public func setProcessBytesHandler(_ handler: (@Sendable (ArraySlice<UInt8>) -> Void)?) {
-        processBytesHandler.withLock { $0 = handler }
+        processBytesHandler.replace(with: handler)
     }
     
     /**
