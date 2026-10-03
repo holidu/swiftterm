@@ -911,6 +911,23 @@ public final class Buffer {
         return hasScrollback
     }
     
+    /// Blanks the rows of the prompt the shell is sitting at (OSC 133 `A` through the end of the
+    /// buffer) so reflow cannot change how many rows lie between the prompt's first row and the
+    /// cursor. A shell that redraws its prompt on SIGWINCH moves up by the row count it drew at
+    /// the old width; a reflowed full-width prompt row leaves its first half above that point.
+    func clearPromptRowsForResize() {
+        guard cols > 0, lines.count > 0,
+              semanticInput == .prompt || semanticInput == .armed,
+              let start = semanticPromptStartRow,
+              start <= yBase + y else { return }
+        let blank = getPackedBlankCell(attribute: CharData.defaultAttr)
+        for row in start..<lines.count {
+            let line = lines[row]
+            line.clear(with: blank)
+            if row > start { line.isWrapped = false }
+        }
+    }
+
     public func resize (newCols : Int, newRows : Int)
     {
         let defaultBlank = PackedCell()

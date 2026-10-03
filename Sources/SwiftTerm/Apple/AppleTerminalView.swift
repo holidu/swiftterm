@@ -4515,6 +4515,14 @@ extension TerminalView {
         frameDriver.markDirty()
     }
 
+    /// See ``Terminal/clearsShellPromptOnResize``.
+    public func setClearsShellPromptOnResize(_ enabled: Bool)
+    {
+        withTerminal { terminal in
+            terminal.clearsShellPromptOnResize = enabled
+        }
+    }
+
     /**
      * Discards the scrollback history without clearing the visible screen,
      * the equivalent of Terminal.app's "Clear to Start" / Cmd-K affordance.

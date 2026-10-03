@@ -1317,7 +1317,15 @@ open class Terminal {
         altBuffer.setupTabStops(index: index, tabStopWidth: tabStopWidth)
     }
     
+    /// Opt-in for a shell that redraws its prompt on SIGWINCH (zsh): a width change while the
+    /// shell is idle at an OSC 133 prompt blanks the prompt's rows instead of reflowing them.
+    /// Off by default, because a shell that does not redraw (bash) would be left with no prompt.
+    public var clearsShellPromptOnResize = false
+
     func resizeBuffers(newColumns: Int, newRows: Int) {
+        if clearsShellPromptOnResize, buffer !== altBuffer, newColumns != normalBuffer.cols {
+            normalBuffer.clearPromptRowsForResize()
+        }
         if buffer !== altBuffer {
             // Correct the savedY cursor to follow changes to y. When the alternate buffer is
             // active, defer this potentially large normal-buffer reflow until it is visible.
