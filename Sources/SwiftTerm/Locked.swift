@@ -170,4 +170,25 @@ final class LockedBytesCallback: @unchecked Sendable {
     }
 }
 
+/// Stores the replaceable input gate with its concrete function type, for the reason
+/// `LockedBytesCallback` gives.
+final class LockedInputGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var gate: (@Sendable (ArraySlice<UInt8>) -> Bool)?
+
+    func replace(with body: (@Sendable (ArraySlice<UInt8>) -> Bool)?) {
+        lock.lock()
+        gate = body
+        lock.unlock()
+    }
+
+    /// True when the installed gate took the bytes; false with no gate.
+    func consumes(_ bytes: ArraySlice<UInt8>) -> Bool {
+        lock.lock()
+        let current = gate
+        lock.unlock()
+        return current?(bytes) ?? false
+    }
+}
+
 #endif // !SWIFTTERM_EMBEDDED

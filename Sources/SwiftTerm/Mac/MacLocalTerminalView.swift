@@ -139,6 +139,7 @@ final class LocalProcessTerminalViewProcessAdapter:
     private let diagnosticsState: Locked<TerminalView.Diagnostics>
     private let outputHandler: LockedVoidCallback
     private let bytesHandler: LockedBytesCallback
+    private let inputGate: LockedInputGate
     private let windowSize = Locked(winsize())
     private let inputProcess = Locked(WeakLocalProcessInputReference())
     private let failureHandler: @MainActor @Sendable (LocalProcessError) -> Void
@@ -149,6 +150,7 @@ final class LocalProcessTerminalViewProcessAdapter:
          diagnosticsState: Locked<TerminalView.Diagnostics>,
          outputHandler: LockedVoidCallback,
          bytesHandler: LockedBytesCallback,
+         inputGate: LockedInputGate = LockedInputGate(),
          failureHandler: @escaping @MainActor @Sendable (LocalProcessError) -> Void,
          terminationHandler: @escaping @MainActor @Sendable (Int32?) -> Void) {
         self.renderOwner = renderOwner
@@ -156,6 +158,7 @@ final class LocalProcessTerminalViewProcessAdapter:
         self.diagnosticsState = diagnosticsState
         self.outputHandler = outputHandler
         self.bytesHandler = bytesHandler
+        self.inputGate = inputGate
         self.failureHandler = failureHandler
         self.terminationHandler = terminationHandler
     }
@@ -169,6 +172,7 @@ final class LocalProcessTerminalViewProcessAdapter:
     }
 
     func sendInput(_ bytes: [UInt8]) {
+        if inputGate.consumes(bytes[...]) { return }
         inputProcess.withLock { reference in
             reference.value?.send(data: bytes[...])
         }
@@ -254,6 +258,7 @@ open class LocalProcessTerminalView: TerminalView, TerminalViewDelegate {
     private(set) var processAdapter: LocalProcessTerminalViewProcessAdapter!
     nonisolated private let processOutputHandler = LockedVoidCallback()
     nonisolated private let processBytesHandler = LockedBytesCallback()
+    nonisolated private let processInputGate = LockedInputGate()
 
     public override init (frame: CGRect)
     {
@@ -283,6 +288,7 @@ open class LocalProcessTerminalView: TerminalView, TerminalViewDelegate {
             diagnosticsState: diagnosticsState,
             outputHandler: processOutputHandler,
             bytesHandler: processBytesHandler,
+            inputGate: processInputGate,
             failureHandler: { [weak self] error in
                 guard let self, let process = self.process else { return }
                 self.processFailedToStart(process, error: error)
@@ -321,6 +327,18 @@ open class LocalProcessTerminalView: TerminalView, TerminalViewDelegate {
     /// touch AppKit; hop to the main queue for anything else. Batches arrive in order.
     public func setProcessBytesHandler(_ handler: (@Sendable (ArraySlice<UInt8>) -> Void)?) {
         processBytesHandler.replace(with: handler)
+    }
+
+    /// Installs a gate that sees every input batch bound for the process, on the thread that sent
+    /// it, before it is written. Returning true keeps the bytes from the process; the host owns them.
+    ///
+    /// In SwiftTerm 2 user input (keys, paste, `send(data:)`) goes from the view's input sender
+    /// straight to the process, so overriding `send(source:data:)` on a subclass no longer sees it.
+    /// This is the replacement for hosts that hold or filter input. `send(source:data:)` on this
+    /// class writes to the process directly and does not pass through the gate, so a host can
+    /// release what it held that way. The gate must return quickly and must not touch AppKit.
+    public func setProcessInputGate(_ gate: (@Sendable (ArraySlice<UInt8>) -> Bool)?) {
+        processInputGate.replace(with: gate)
     }
     
     /**
